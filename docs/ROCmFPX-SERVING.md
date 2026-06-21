@@ -14,40 +14,51 @@ allocation cap, so start the server at the highest draft depth you plan to test.
 
 ## Build
 
-For Strix Halo, build the server with the normal ROCmFP4/ROCmFPX script:
+This repository branch is the CHADROCK/llama.cpp runner used for the reproduced
+serving rows. Clone the branch, then build `llama-server` from this tree:
+
+```bash
+git clone https://github.com/ciru-ai/ROCmFPX.git
+cd ROCmFPX
+git checkout rocmfpx-mtp-serving-controls
+```
+
+For Strix Halo, build the runner with the normal ROCmFP4/ROCmFPX script:
 
 ```bash
 env JOBS=16 scripts/build-strix-rocmfp4-mtp.sh llama-server llama-bench
 ```
 
-The served MTP helper expects this binary by default:
+The runner binary is:
 
 ```text
-build-vulkan-server-noui/bin/llama-server
+build-strix-rocmfp4/bin/llama-server
 ```
 
-Set `BUILD_DIR` or `BIN` if your build directory is different:
+Set `BUILD_DIR` or `BIN` if your build directory is different. The helper
+scripts only wrap this locally built `llama-server`; they do not use a separate
+runtime.
 
 ```bash
 BUILD_DIR="$PWD/build-strix-rocmfp4" \
-  scripts/run-rocmfpx-fp3-mtp-server-speed-profile.sh
+  scripts/run-rocmfpx-mtp-server.sh
 ```
 
-## Start The FP3 Speed Profile
+## Start A CHADROCK MTP Runner
 
 The helper script starts a single-slot OpenAI-compatible server with metrics,
 MTP enabled, prompt-cache isolation for benchmarking, and request-level draft
 overrides available:
 
 ```bash
-MODEL=/path/to/model-Q3_0_ROCMFPX.gguf \
+MODEL=/path/to/model.gguf \
 PORT=18180 \
 CTX_SIZE=135168 \
 SPEC_DRAFT_N_MAX=4 \
 SPEC_DRAFT_N_MIN=0 \
 SPEC_DRAFT_P_MIN=0.75 \
 SPEC_DRAFT_P_SPLIT=0.10 \
-scripts/run-rocmfpx-fp3-mtp-server-speed-profile.sh
+scripts/run-rocmfpx-mtp-server.sh
 ```
 
 Useful defaults in that script:
@@ -58,6 +69,8 @@ BATCH_SIZE=2048
 UBATCH_SIZE=512
 CACHE_TYPE_K=f16
 CACHE_TYPE_V=f16
+CACHE_TYPE_K_DRAFT=f16
+CACHE_TYPE_V_DRAFT=f16
 THREADS=16
 THREADS_BATCH=32
 STRICT_BENCH=1
@@ -66,6 +79,112 @@ STRICT_BENCH=1
 `STRICT_BENCH=1` disables prompt-cache reuse and sets slot prompt similarity to
 zero so repeated benchmark rows are easier to compare. For interactive serving,
 set `STRICT_BENCH=0` if you want normal prompt cache behavior.
+
+## Recreate The 35B ROCmFP4 Rows
+
+The 35B ~140 tok/s rows were produced by the patched CHADROCK runner with one
+server slot, no prompt cache, Vulkan0, and served `/completion` requests.
+
+Qwen3.6 35B A3B ROCmFP4 starting point:
+
+```bash
+MODEL=/path/to/Qwen3.6-35B-A3B-MTP-BF16-to-ROCmFP4-STRIX_LEAN.gguf \
+ALIAS=chadrock-35b-rocmfp4-cap4 \
+PORT=18180 \
+CTX_SIZE=135168 \
+DEVICE=Vulkan0 \
+SPEC_DRAFT_DEVICE=Vulkan0 \
+BATCH_SIZE=2048 \
+UBATCH_SIZE=512 \
+CACHE_TYPE_K=f16 \
+CACHE_TYPE_V=f16 \
+CACHE_TYPE_K_DRAFT=f16 \
+CACHE_TYPE_V_DRAFT=f16 \
+SPEC_DRAFT_N_MAX=4 \
+SPEC_DRAFT_N_MIN=0 \
+SPEC_DRAFT_P_MIN=0.0 \
+SPEC_DRAFT_P_SPLIT=0.10 \
+STRICT_BENCH=1 \
+scripts/run-rocmfpx-mtp-server.sh
+```
+
+ACE/SABER 35B ROCmFP4 text winner:
+
+```bash
+MODEL=/path/to/Qwen3.6-35B-A3B-NSC-ACE-SABER-MTP-F16-to-ROCmFP4-STRIX_LEAN.gguf \
+ALIAS=chadrock-35b-ace-saber-rocmfp4-cap4 \
+PORT=18180 \
+CTX_SIZE=32768 \
+DEVICE=Vulkan0 \
+SPEC_DRAFT_DEVICE=Vulkan0 \
+BATCH_SIZE=2048 \
+UBATCH_SIZE=512 \
+CACHE_TYPE_K=f16 \
+CACHE_TYPE_V=f16 \
+CACHE_TYPE_K_DRAFT=f16 \
+CACHE_TYPE_V_DRAFT=f16 \
+SPEC_DRAFT_N_MAX=4 \
+SPEC_DRAFT_N_MIN=0 \
+SPEC_DRAFT_P_MIN=0.25 \
+SPEC_DRAFT_P_SPLIT=0.10 \
+NO_MMPROJ=1 \
+STRICT_BENCH=1 \
+scripts/run-rocmfpx-mtp-server.sh
+```
+
+Use request payloads with `n_predict=512` or `max_tokens=512`,
+`temperature=0`, `ignore_eos=true`, and:
+
+```json
+{
+  "speculative.n_max": 4,
+  "speculative.n_min": 0,
+  "speculative.p_min": 0.25
+}
+```
+
+The measured ACE/SABER row was `143.08` decode tok/s at gen512 and repeated at
+`141.77` decode tok/s at gen2048 on the 3946-token prompt.
+
+## Recreate The 27B ROCmFP4 Row
+
+The >50 tok/s 27B row used the same patched runner, but a deeper cap and
+separate target/draft KV types:
+
+```bash
+MODEL=/path/to/Qwable-5-27B-Coder-BF16-to-ROCmFP4-STRIX_LEAN.gguf \
+ALIAS=qwable5-27b-coder-rocmfp4-cap6 \
+PORT=18180 \
+CTX_SIZE=32768 \
+DEVICE=Vulkan0 \
+SPEC_DRAFT_DEVICE=Vulkan0 \
+BATCH_SIZE=2048 \
+UBATCH_SIZE=512 \
+CACHE_TYPE_K=q8_0 \
+CACHE_TYPE_V=q8_0 \
+CACHE_TYPE_K_DRAFT=f16 \
+CACHE_TYPE_V_DRAFT=f16 \
+SPEC_DRAFT_N_MAX=6 \
+SPEC_DRAFT_N_MIN=0 \
+SPEC_DRAFT_P_MIN=0.0 \
+SPEC_DRAFT_P_SPLIT=0.20 \
+STRICT_BENCH=1 \
+scripts/run-rocmfpx-mtp-server.sh
+```
+
+Use this request policy:
+
+```json
+{
+  "speculative.n_max": 6,
+  "speculative.n_min": 0,
+  "speculative.p_min": 0.0
+}
+```
+
+The measured 27B rows on the 3946-token prompt were `52.67` decode tok/s,
+`53.39` decode tok/s on an exact repeat, and `52.08` decode tok/s at gen2048.
+The no-MTP served control was `12.78` decode tok/s.
 
 ## Per-Request Overrides
 
@@ -96,7 +215,7 @@ OpenAI chat-compatible requests use the same keys in the top-level payload:
 curl -sS http://127.0.0.1:18180/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "rocmfpx-fp3-mtp-speed",
+    "model": "chadrock-35b-ace-saber-rocmfp4-cap4",
     "messages": [
       {"role": "user", "content": "Summarize the request-level MTP knobs."}
     ],
@@ -108,47 +227,17 @@ curl -sS http://127.0.0.1:18180/v1/chat/completions \
   }'
 ```
 
-## Dynamic Prompt-Length Policy
+## Measured Starting Points
 
-The FP3 long-context sweep currently supports this request-admission policy:
-
-| Prompt tokens | Request policy |
-|---:|---|
-| `< 49152` | `speculative.n_max=4`, `speculative.n_min=0`, `speculative.p_min=0.75` |
-| `>= 49152` | `speculative.n_max=2`, `speculative.n_min=0`, `speculative.p_min=0.0` |
-
-Use the helper to emit the JSON fields:
-
-```bash
-scripts/rocmfpx-draft-profile.py --prompt-tokens 128278
-```
-
-Or let it count tokens through a running server:
-
-```bash
-scripts/rocmfpx-draft-profile.py \
-  --base-url http://127.0.0.1:18180 \
-  --prompt-file /path/to/prompt.txt
-```
-
-Attach the emitted JSON fields to the request before sending `/completion` or
-`/v1/chat/completions`. The current implementation chooses policy at request
-admission; it does not switch draft settings mid-generation.
-
-## FP4 Transfer
-
-The request-level controls are quant-agnostic and can be used for ROCmFP4 MTP
-serving, but FP3 winners should not be copied blindly to FP4 profiles.
-
-Current measured FP4 starting points:
+Current measured ROCmFP4 starting points:
 
 | Model family | Starting point |
 |---|---|
 | Qwen3.6 35B A3B ROCmFP4 | `n_max=4`, `n_min=0`, `p_min=0.0`, `b2048/u512`, `f16/f16` target and draft KV |
 | ACE/SABER 35B ROCmFP4 text profile | `n_max=4`, `n_min=0`, `p_min=0.25`, `b2048/u512`, `f16/f16` target and draft KV |
-| Qwable 5 27B Coder ROCmFP4 | `n_max=6`, `n_min=0`, `p_min=0.0`, `p_split=0.20`, target KV `q8`, draft KV `f16`, `b2048/u512` |
+| Qwable 5 27B Coder ROCmFP4 | `n_max=6`, `n_min=0`, `p_min=0.0`, `p_split=0.20`, target KV `q8_0`, draft KV `f16`, `b2048/u512` |
 
-For FP4 tests, start the server with a cap at least as high as the deepest
+For MTP tests, start the server with a cap at least as high as the deepest
 candidate:
 
 ```bash
@@ -157,7 +246,7 @@ SPEC_DRAFT_N_MIN=0 \
 SPEC_DRAFT_P_MIN=0.0 \
 SPEC_DRAFT_P_SPLIT=0.20 \
 MODEL=/path/to/model-Q4_0_ROCMFP4.gguf \
-scripts/run-rocmfpx-fp3-mtp-server-speed-profile.sh
+scripts/run-rocmfpx-mtp-server.sh
 ```
 
 Then vary `speculative.n_max` and `speculative.p_min` per request.
