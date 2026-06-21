@@ -117,6 +117,9 @@ build-strix-rocmfp4/bin/test-backend-ops
 For RDNA2/RDNA3/RDNA4 builds, use the same binary names under that build
 folder, for example `build-rdna3/bin/llama-quantize`.
 
+For served MTP profiles and request-level draft overrides, see
+[`docs/ROCmFPX-SERVING.md`](docs/ROCmFPX-SERVING.md).
+
 ## Quantize Straight ROCmFPX Models
 
 Use BF16 or F16 GGUF sources. The wrapper keeps split GGUFs split by default.

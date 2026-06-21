@@ -100,6 +100,9 @@ scripts/rocmfpx-draft-profile.py \
 The server should still start with a high enough allocation cap, for example
 `--spec-draft-n-max 4`; the helper only lowers request settings.
 
+Serving instructions and request examples are in
+[`docs/ROCmFPX-SERVING.md`](ROCmFPX-SERVING.md).
+
 ### 2. FP3 Speed PRs
 
 Keep only material patches:
