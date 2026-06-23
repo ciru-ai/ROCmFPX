@@ -343,11 +343,38 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
 
+struct common_params_dynamic_draft_rule {
+    int32_t prompt_min = 0;  // inclusive lower prompt-token bound for this rule
+    int32_t n_max      = -1; // -1 means keep the current setting
+    int32_t n_min      = -1; // -1 means keep the current setting
+    float   p_min      = -1; // < 0 means keep the current setting
+};
+
+struct common_params_dynamic_draft {
+    bool enabled = false;
+    bool force   = false; // override request-level speculative.* fields when enabled
+
+    std::string policy; // e.g. "0:n4,p0.25;49152:n4,p0.0"
+    std::vector<common_params_dynamic_draft_rule> rules;
+
+    // Per-request decision metadata. This is filled by llama-server after
+    // tokenization and emitted through generation_settings for benchmarking.
+    bool applied = false;
+    std::string reason;
+    int32_t prompt_tokens  = -1;
+    int32_t cap_n_max      = -1;
+    int64_t decision_us    = 0;
+    int32_t selected_n_max = -1;
+    int32_t selected_n_min = -1;
+    float   selected_p_min = -1;
+};
+
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
+    common_params_dynamic_draft dynamic_draft;
 
     common_params_speculative_ngram_mod ngram_mod;
     common_params_speculative_ngram_map ngram_simple;
@@ -1059,13 +1086,25 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 //
 
 struct common_prompt_checkpoint {
-    int64_t n_tokens;
+    int64_t n_tokens = 0;
 
-    llama_pos pos_min;
-    llama_pos pos_max;
+    llama_pos pos_min = 0;
+    llama_pos pos_max = 0;
 
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
+
+    llama_state_seq_storage * storage_tgt = nullptr;
+    llama_state_seq_storage * storage_dft = nullptr;
+
+    common_prompt_checkpoint() = default;
+    ~common_prompt_checkpoint();
+
+    common_prompt_checkpoint(const common_prompt_checkpoint & other);
+    common_prompt_checkpoint & operator=(const common_prompt_checkpoint & other);
+
+    common_prompt_checkpoint(common_prompt_checkpoint && other) noexcept;
+    common_prompt_checkpoint & operator=(common_prompt_checkpoint && other) noexcept;
 
     size_t size() const;
 
@@ -1087,12 +1126,12 @@ struct common_prompt_checkpoint {
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
-    void load_tgt(
+    bool load_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
 
-    void load_dft(
+    bool load_dft(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;

@@ -80,6 +80,15 @@ json task_params::to_json(bool only_metrics) const {
             {"speculative.n_max",         speculative.draft.n_max},
             {"speculative.n_min",         speculative.draft.n_min},
             {"speculative.p_min",         speculative.draft.p_min},
+            {"dynamic_draft.enabled",     speculative.dynamic_draft.enabled},
+            {"dynamic_draft.applied",     speculative.dynamic_draft.applied},
+            {"dynamic_draft.reason",      speculative.dynamic_draft.reason},
+            {"dynamic_draft.policy",      speculative.dynamic_draft.policy},
+            {"dynamic_draft.prompt_tokens", speculative.dynamic_draft.prompt_tokens},
+            {"dynamic_draft.decision_us", speculative.dynamic_draft.decision_us},
+            {"dynamic_draft.selected_n_max", speculative.dynamic_draft.selected_n_max},
+            {"dynamic_draft.selected_n_min", speculative.dynamic_draft.selected_n_min},
+            {"dynamic_draft.selected_p_min", speculative.dynamic_draft.selected_p_min},
             {"timings_per_token",         timings_per_token},
             {"post_sampling_probs",       post_sampling_probs},
             {"backend_sampling",          sampling.backend_sampling},
@@ -140,6 +149,15 @@ json task_params::to_json(bool only_metrics) const {
         {"speculative.n_max",         speculative.draft.n_max},
         {"speculative.n_min",         speculative.draft.n_min},
         {"speculative.p_min",         speculative.draft.p_min},
+        {"dynamic_draft.enabled",     speculative.dynamic_draft.enabled},
+        {"dynamic_draft.applied",     speculative.dynamic_draft.applied},
+        {"dynamic_draft.reason",      speculative.dynamic_draft.reason},
+        {"dynamic_draft.policy",      speculative.dynamic_draft.policy},
+        {"dynamic_draft.prompt_tokens", speculative.dynamic_draft.prompt_tokens},
+        {"dynamic_draft.decision_us", speculative.dynamic_draft.decision_us},
+        {"dynamic_draft.selected_n_max", speculative.dynamic_draft.selected_n_max},
+        {"dynamic_draft.selected_n_min", speculative.dynamic_draft.selected_n_min},
+        {"dynamic_draft.selected_p_min", speculative.dynamic_draft.selected_p_min},
         {"timings_per_token",         timings_per_token},
         {"post_sampling_probs",       post_sampling_probs},
         {"backend_sampling",          sampling.backend_sampling},
@@ -302,6 +320,7 @@ task_params server_task::params_from_json_cmpl(
 
     params.speculative = defaults.speculative;
     const int32_t draft_n_max_cap = std::max(0, defaults.speculative.draft.n_max);
+    params.speculative.dynamic_draft.cap_n_max = draft_n_max_cap;
     params.speculative.draft.n_max = json_value(data, "speculative.n_max", defaults.speculative.draft.n_max);
     params.speculative.draft.n_max = std::max(0, std::min(params.speculative.draft.n_max, draft_n_max_cap));
     params.speculative.draft.n_min = json_value(data, "speculative.n_min", defaults.speculative.draft.n_min);

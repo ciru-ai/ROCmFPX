@@ -24,6 +24,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cinttypes>
 #include <climits>
 #include <cstdarg>
@@ -70,6 +71,104 @@ static std::string read_file(const std::string & fname) {
     std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     file.close();
     return content;
+}
+
+static std::string trim_copy(std::string value) {
+    auto is_not_space = [](unsigned char ch) { return !std::isspace(ch); };
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), is_not_space));
+    value.erase(std::find_if(value.rbegin(), value.rend(), is_not_space).base(), value.end());
+    return value;
+}
+
+static std::string lower_copy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return (char) std::tolower(ch);
+    });
+    return value;
+}
+
+static bool parse_dynamic_draft_value(const std::string & item, const std::string & key, std::string & value) {
+    if (item == key) {
+        throw std::invalid_argument("missing value for dynamic draft setting '" + item + "'");
+    }
+
+    const std::string prefix_eq = key + "=";
+    if (item.rfind(prefix_eq, 0) == 0) {
+        value = item.substr(prefix_eq.size());
+        return true;
+    }
+
+    const std::string prefix_colon = key + ":";
+    if (item.rfind(prefix_colon, 0) == 0) {
+        value = item.substr(prefix_colon.size());
+        return true;
+    }
+
+    return false;
+}
+
+static std::vector<common_params_dynamic_draft_rule> parse_dynamic_draft_policy(const std::string & policy) {
+    std::vector<common_params_dynamic_draft_rule> rules;
+
+    for (const auto & raw_rule : string_split<std::string>(policy, ';')) {
+        const std::string rule = trim_copy(raw_rule);
+        if (rule.empty()) {
+            continue;
+        }
+
+        const auto parts = string_split<std::string>(rule, ':');
+        if (parts.size() != 2) {
+            throw std::invalid_argument("invalid dynamic draft rule '" + rule + "'; expected MIN:SETTING[,SETTING...]");
+        }
+
+        common_params_dynamic_draft_rule parsed;
+        parsed.prompt_min = std::stoi(trim_copy(parts[0]));
+        if (parsed.prompt_min < 0) {
+            throw std::invalid_argument("invalid dynamic draft lower bound in rule '" + rule + "'");
+        }
+
+        for (const auto & raw_item : string_split<std::string>(parts[1], ',')) {
+            const std::string item = lower_copy(trim_copy(raw_item));
+            if (item.empty()) {
+                continue;
+            }
+
+            std::string value;
+            if (item[0] == 'n' && item.size() > 1 && std::isdigit((unsigned char) item[1])) {
+                parsed.n_max = std::stoi(item.substr(1));
+            } else if (item[0] == 'm' && item.size() > 1 && std::isdigit((unsigned char) item[1])) {
+                parsed.n_min = std::stoi(item.substr(1));
+            } else if (item[0] == 'p' && item.size() > 1 && (std::isdigit((unsigned char) item[1]) || item[1] == '.')) {
+                parsed.p_min = std::stof(item.substr(1));
+            } else if (parse_dynamic_draft_value(item, "n", value) ||
+                       parse_dynamic_draft_value(item, "n_max", value) ||
+                       parse_dynamic_draft_value(item, "max", value)) {
+                parsed.n_max = std::stoi(value);
+            } else if (parse_dynamic_draft_value(item, "m", value) ||
+                       parse_dynamic_draft_value(item, "n_min", value) ||
+                       parse_dynamic_draft_value(item, "min", value)) {
+                parsed.n_min = std::stoi(value);
+            } else if (parse_dynamic_draft_value(item, "p", value) ||
+                       parse_dynamic_draft_value(item, "p_min", value)) {
+                parsed.p_min = std::stof(value);
+            } else {
+                throw std::invalid_argument("unknown dynamic draft setting '" + item + "' in rule '" + rule + "'");
+            }
+        }
+
+        if (parsed.n_max < -1 || parsed.n_min < -1 ||
+            (parsed.p_min < 0.0f && parsed.p_min != -1.0f) || parsed.p_min > 1.0f) {
+            throw std::invalid_argument("invalid dynamic draft value in rule '" + rule + "'");
+        }
+
+        rules.push_back(parsed);
+    }
+
+    std::sort(rules.begin(), rules.end(), [](const auto & a, const auto & b) {
+        return a.prompt_min < b.prompt_min;
+    });
+
+    return rules;
 }
 
 static const std::vector<common_arg> & get_common_arg_defs() {
@@ -3557,6 +3656,31 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.p_min = std::stof(value);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
+    add_opt(common_arg(
+        {"--dd", "--dynamic-draft"},
+        {"--no-dd", "--no-dynamic-draft"},
+        "enable server-side Dynamic Draft policy selection after request tokenization",
+        [](common_params & params, bool value) {
+            params.speculative.dynamic_draft.enabled = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DYNAMIC_DRAFT"));
+    add_opt(common_arg(
+        {"--dd-policy", "--dynamic-draft-policy"}, "POLICY",
+        "Dynamic Draft policy rules, e.g. 0:n4,p0.25;49152:n4,p0.0. "
+        "Each rule applies at prompt token counts >= its lower bound.",
+        [](common_params & params, const std::string & value) {
+            params.speculative.dynamic_draft.policy = value;
+            params.speculative.dynamic_draft.rules  = parse_dynamic_draft_policy(value);
+            params.speculative.dynamic_draft.enabled = !params.speculative.dynamic_draft.rules.empty();
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DYNAMIC_DRAFT_POLICY"));
+    add_opt(common_arg(
+        {"--dd-force", "--dynamic-draft-force"},
+        "force Dynamic Draft to override request-level speculative.* fields",
+        [](common_params & params) {
+            params.speculative.dynamic_draft.force = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DYNAMIC_DRAFT_FORCE"));
     add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},
