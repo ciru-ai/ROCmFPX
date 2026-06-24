@@ -72,6 +72,7 @@ static const ftype_name_entry ftype_name_table[] = {
     { "Q8_0_ROCMFPX_AGENT",      LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX_AGENT      },
     { "Q6_0_ROCMFPX_STRIX_LEAN", LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_STRIX_LEAN },
     { "Q6_0_ROCMFPX_STRIX_SPEED", LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_STRIX_SPEED },
+    { "Q6_0_ROCMFPX_STRIX_QUALITY", LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_STRIX_QUALITY },
 };
 
 static llama_ftype llama_ftype_from_name(const char * name) {
