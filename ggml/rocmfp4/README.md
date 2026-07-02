@@ -813,16 +813,18 @@ Current status:
     Follow-up ROCm0 KV isolation confirmed this is not a draft-cache issue:
     q8 main KV with q4 draft KV measured `33.5 tok/s` short and `25.3 tok/s`
     sustained, q8 main K only measured `31.5` and `21.4 tok/s`, and q8 main V
-    only measured `31.1` and `21.9 tok/s`. The promoted ROCm0 path therefore
-    keeps both accepted and draft KV at q4.
+    only measured `31.1` and `21.9 tok/s`. The shipped UltraQuality profile now
+    uses fp16 draft KV for the draft context while keeping the target-side KV
+    choice explicit in the profile.
     `--spec-draft-p-split 0.05` and `0.20` both tied the `27.7 tok/s`
     sustained guard, `-t 24 -tb 32 --spec-draft-threads 24
     --spec-draft-threads-batch 32` tied, and trimming the sampler chain to
     `top_k;top_p;temperature` regressed sustained decode to `26.6 tok/s`.
     Draft-only q8 KV (`SPEC_DRAFT_TYPE_K=q8_0`,
-    `SPEC_DRAFT_TYPE_V=q8_0`) with main KV left at q4 tied the promoted path
-    at `33.6 tok/s` short and `27.7 tok/s` sustained, so the leaner q4 draft
-    KV default remains promoted.
+    `SPEC_DRAFT_TYPE_V=q8_0`) with main KV left at q4 tied the older q4-draft
+    guard at `33.6 tok/s` short and `27.7 tok/s` sustained. For the public
+    UltraQuality serving profile, use fp16 draft KV instead of the older q4
+    draft default.
     The heavier Qwen3.6 27B MTP `STRIX_MTP_Q6` ROCmFP4 profile was also
     checked with the same ROCm0 guard. It reached `30.1 tok/s` on the short
     prompt but only `21.3 tok/s` sustained, below the guard floor, so the
@@ -834,8 +836,8 @@ Current status:
     `SPEC_DRAFT_TYPE_K`, `SPEC_DRAFT_TYPE_V`, `EXTRA_ARGS`, and
     `SPEC_EXTRA_ARGS` environment overrides for
     controlled sweeps while defaulting to the promoted `n-max 4`, `n-min 0`,
-    `p-min 0.0`, `p-split 0.10`, q4 KV, `-t 16`, `-tb 32`, `-b 512`, and
-    `-ub 512` settings.
+    `p-min 0.0`, `p-split 0.10`, fp16 draft KV, `-t 16`, `-tb 32`, `-b 512`,
+    and `-ub 512` settings.
   - `scripts/check-rocmfp4-quant-regression.sh` runs quant correctness plus
     CPU quantizer, dequantizer, and vec-dot cycle ceilings for both ROCmFP4
     block layouts. It checks normal and imatrix quantization, and now also

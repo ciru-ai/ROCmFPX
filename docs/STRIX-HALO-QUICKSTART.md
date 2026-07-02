@@ -153,8 +153,8 @@ GGML_HIP_ENABLE_UNIFIED_MEMORY=1 \
   --spec-draft-n-min 0 \
   --spec-draft-p-min 0.0 \
   --spec-draft-p-split 0.10 \
-  --spec-draft-type-k q4_0 \
-  --spec-draft-type-v q4_0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
   --jinja \
   -if
 ```

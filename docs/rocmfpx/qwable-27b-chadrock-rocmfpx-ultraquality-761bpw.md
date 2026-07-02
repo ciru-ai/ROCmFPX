@@ -9,6 +9,7 @@ runtime profile.
 - Public name: `Qwable 27B Chadrock-ROCmFPX-ULTRAQUALITY-7.61BPW`
 - Policy: ranked attention leave-16
 - Runtime profile: `rocmfpx-strix-mmid5`
+- Served profile KV: `q8_0/q8_0` target KV with `f16/f16` draft KV
 - GGUF artifact basename:
   `Qwen3.6-27B-MTP-Q6ONLY_ROCMFPX_FFNALL_ATTNRANKLEAVE16_Q6K_SPLICE.gguf`
 - Measured tensor BPW: `7.613087`
@@ -34,6 +35,13 @@ Build or run with the Strix `mmid5` ROCmFPX decode profile:
 
 ```bash
 scripts/rocmfp4-decode-tune-flags.sh rocmfpx-strix-mmid5
+```
+
+Serve the lane with fp16 draft KV:
+
+```bash
+--spec-draft-type-k f16 \
+--spec-draft-type-v f16
 ```
 
 ## Speed Evidence
