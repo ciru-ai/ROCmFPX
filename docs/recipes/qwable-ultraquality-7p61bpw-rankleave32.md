@@ -1,8 +1,9 @@
-# Qwable UltraQuality 7.61 BPW ROCmFPX Recipe
+# Qwable-27B-Chadrock-ROCmFPX-ULTRAQUALITY-7.61BPW Recipe
 
-This recipe reproduces the Qwable 27B Chadrock ROCmFPX UltraQuality 7.61 BPW
-lane. UltraQuality is the public name for the ranked leave-32 ROCmFPX/Q6_K
-splice candidate:
+This recipe reproduces the released
+`Qwable-27B-Chadrock-ROCmFPX-ULTRAQUALITY-7.61BPW` model. The Hugging Face card
+and GGUF filename are the model identity source of truth. UltraQuality is the
+recipe label for the ranked leave-32 ROCmFPX/Q6_K splice candidate:
 
 ```text
 Qwable-27B-Chadrock-ROCmFPX-ULTRAQUALITY-7.61BPW.gguf
@@ -12,8 +13,9 @@ Qwable-27B-Chadrock-ROCmFPX-ULTRAQUALITY-7.61BPW.gguf
 
 | Field | Value |
 | --- | --- |
-| Base model family | Qwen3.6 27B MTP GGUF |
-| Public model name | Qwable 27B Chadrock-ROCmFPX-ULTRAQUALITY-7.61BPW |
+| Implementation/topology | `qwen35` dense hybrid |
+| Public model name | `Qwable-27B-Chadrock-ROCmFPX-ULTRAQUALITY-7.61BPW` |
+| Internal recipe ID | `rocmfpx.qwen35.dense.ultraquality.v1` |
 | Quant policy | ROCmFPX Q6 base with ranked leave-32 attention tensors and Q6_K splice |
 | Output BPW | 7.6146 |
 | Output bytes | 26,004,616,416 |
