@@ -3280,7 +3280,16 @@ private:
 
                 completion_token_output result;
                 result.tok          = id;
-                result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+                // Never render EOG-token text unless --special is set. The PEG auto
+                // parser preserves the template's turn-end marker (content.end), which
+                // forces accept_special_token() true for e.g. hy_v3's
+                // <｜hy_eos:opensource｜>, but its non-wrapped content parser consumes
+                // the rest of the text without stripping that marker, so the EOG text
+                // would leak into the chat response. Generation stops on this token, so
+                // the parser never needs to see it.
+                const bool render_special = accept_special_token(slot, result.tok);
+                result.text_to_send = (!params_base.special && llama_vocab_is_eog(vocab, result.tok))
+                    ? "" : common_token_to_piece(slot.ctx_tgt, result.tok, render_special);
                 result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
 
                 if (slot.task->params.sampling.n_probs > 0) {
@@ -3419,7 +3428,11 @@ private:
                     completion_token_output result;
 
                     result.tok          = ids[i];
-                    result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+                    // see the non-speculative path above: never render EOG-token text
+                    // unless --special is set (preserved_tokens must not force it)
+                    const bool render_special = accept_special_token(slot, result.tok);
+                    result.text_to_send = (!params_base.special && llama_vocab_is_eog(vocab, result.tok))
+                        ? "" : common_token_to_piece(slot.ctx_tgt, result.tok, render_special);
                     result.prob         = 1.0f; // set later
 
                     // TODO: set result.probs
