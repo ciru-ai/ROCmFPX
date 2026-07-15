@@ -2498,26 +2498,26 @@ bool server_prompt_cache::save_disk(
     const int64_t t_start = ggml_time_us();
 
     const size_t n_main = llama_state_seq_save_file(
-        ctx_main, path_main_tmp.c_str(), id_slot, tokens.data(), tokens.size());
+        ctx_main, path_main_tmp.string().c_str(), id_slot, tokens.data(), tokens.size());
     size_t actual_main = 0;
     if (n_main == 0 ||
         !server_prompt_cache_disk_size_exact(path_main_tmp.string(), n_main, &actual_main) ||
         !server_prompt_cache_disk_flush_and_drop(path_main_tmp.string(), true)) {
         SRV_ERR("prompt cache disk save failed: entry=%" PRIu64 " component=target path=%s\n",
-                entry_id, path_main_tmp.c_str());
+                entry_id, path_main_tmp.string().c_str());
         return fail_io("target-save", path_main_tmp.string());
     }
 
     size_t n_drft = 0;
     if (ctx_drft) {
         n_drft = llama_state_seq_save_file(
-            ctx_drft, path_drft_tmp.c_str(), id_slot, tokens.data(), tokens.size());
+            ctx_drft, path_drft_tmp.string().c_str(), id_slot, tokens.data(), tokens.size());
         size_t actual_drft = 0;
         if (n_drft == 0 ||
             !server_prompt_cache_disk_size_exact(path_drft_tmp.string(), n_drft, &actual_drft) ||
             !server_prompt_cache_disk_flush_and_drop(path_drft_tmp.string(), true)) {
             SRV_ERR("prompt cache disk save failed: entry=%" PRIu64 " component=draft path=%s\n",
-                    entry_id, path_drft_tmp.c_str());
+                    entry_id, path_drft_tmp.string().c_str());
             return fail_io("draft-save", path_drft_tmp.string());
         }
     }
