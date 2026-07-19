@@ -1377,14 +1377,19 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
 
         char arch_dft[64] = {};
         llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch_dft, sizeof(arch_dft));
-        const bool full_hidden_rows =
+        const bool is_gemma4_assistant =
             std::strcmp(arch_dft, "gemma4_assistant") == 0 ||
             std::strcmp(arch_dft, "gemma4-assistant") == 0;
+        const bool full_hidden_rows = is_gemma4_assistant;
 
         llama_set_embeddings_pre_norm(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_pre_norm(ctx_dft, true, full_hidden_rows ? /*masked*/ false : /*masked*/ true);
 
-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+        // Only Gemma4 assistants truly share the target KV. Native-MTP contexts
+        // (e.g. hy_v3) also set ctx_other = ctx_tgt to read the target's hidden
+        // states, but they keep their own draft KV, so the gemma4 same-position
+        // drafting path would collide with the strict consecutive-position check.
+        is_mem_shared = is_gemma4_assistant && llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
         if (chain_heads) {
