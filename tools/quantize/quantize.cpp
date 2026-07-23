@@ -144,7 +144,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
-    printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run]\n");
+    printf("       [--prune-layers] [--keep-split] [--override-kv] [--chat-template-file] [--dry-run]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize\n");
     printf("                                      allow requantizing tensors that have already been quantized\n");
@@ -181,6 +181,8 @@ static void usage(const char * executable) {
     printf("  --override-kv KEY=TYPE:VALUE\n");
     printf("                                      override model metadata by key in the quantized model. may be specified multiple times.\n");
     printf("                                      WARNING: this is an advanced option, use with care.\n");
+    printf("  --chat-template-file file_name\n");
+    printf("                                      embed the complete Jinja chat template from file_name in the output model\n");
     printf("  --dry-run\n");
     printf("                                      calculate and show the final quantization size without performing quantization\n");
     printf("                                      example: llama-quantize --dry-run model-f32.gguf Q4_K\n\n");
@@ -518,6 +520,7 @@ int main(int argc, char ** argv) {
 
     int arg_idx = 1;
     std::string imatrix_file;
+    std::string chat_template;
     std::vector<std::string> included_weights, excluded_weights;
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<tensor_type_option> tensor_type_opts;
@@ -559,6 +562,23 @@ int main(int argc, char ** argv) {
         } else if (strcmp(argv[arg_idx], "--override-kv") == 0) {
             if (arg_idx == argc-1 || !string_parse_kv_override(argv[++arg_idx], kv_overrides)) {
                 usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--chat-template-file") == 0) {
+            if (arg_idx == argc - 1) {
+                usage(argv[0]);
+            }
+            const std::filesystem::path template_path = argv[++arg_idx];
+            std::ifstream template_file(template_path, std::ios::binary);
+            if (!template_file) {
+                fprintf(stderr, "%s: could not open chat template file '%s'\n", __func__, template_path.c_str());
+                return 1;
+            }
+            chat_template.assign(
+                std::istreambuf_iterator<char>(template_file),
+                std::istreambuf_iterator<char>());
+            if (chat_template.empty()) {
+                fprintf(stderr, "%s: chat template file '%s' is empty\n", __func__, template_path.c_str());
+                return 1;
             }
         } else if (strcmp(argv[arg_idx], "--dry-run") == 0) {
             params.dry_run = true;
@@ -660,6 +680,9 @@ int main(int argc, char ** argv) {
     if (!prune_layers.empty()) {
         prune_layers.push_back(-1);  // array terminator
         params.prune_layers = prune_layers.data();
+    }
+    if (!chat_template.empty()) {
+        params.chat_template = chat_template.c_str();
     }
 
     llama_backend_init();

@@ -1,4 +1,5 @@
 hf_repo	artifact	implementation_family	topology	release_recipe_label	internal_recipe_id
+jcbtc/Laguna-S-2.1-Chadrock-ROCmFP4-StrixKVSpine-V4	laguna-s-2.1-ROCmFP4-StrixKVSpine-v4.gguf	laguna	moe	ROCmFP4 StrixKVSpine V4	rocmfp4.laguna.moe.strixkvspine.v4
 jcbtc/Step-3.7-Flash-ROCmFPX-Q3-QualityPlus	Step-3.7-Flash-ROCmFPX-Q3-QualityPlus-*.gguf	step35	moe	ROCmFPX Q3 QualityPlus	rocmfpx-q3.step35.moe.qualityplus.v1
 jcbtc/chadrock-35b-ace-saber-rocmfp4-mtp	Qwen3.6-35B-A3B-NSC-ACE-SABER-MTP-F16-to-ROCmFP4-STRIX_LEAN.gguf	qwen35moe	moe	ROCmFP4 Strix Lean	rocmfp4.qwen35.moe.strix-lean.v1
 jcbtc/chadrock-35b-ace-saber-rocmfp4-mtp	CHADROCK-35B-Ace-Saber-MTP-ROCmFPX-MoEQuality-7.07BPW.gguf	qwen35moe	moe	ROCmFPX MoEQuality	rocmfpx.qwen35.moe.moequality.v1

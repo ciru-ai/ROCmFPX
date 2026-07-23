@@ -27,6 +27,7 @@ or `moe`. Actual BPW belongs to the built artifact, not the stable recipe ID.
 
 | Published GGUF artifact | Hugging Face repository | Internal recipe ID |
 | --- | --- | --- |
+| `laguna-s-2.1-ROCmFP4-StrixKVSpine-v4.gguf` | `jcbtc/Laguna-S-2.1-Chadrock-ROCmFP4-StrixKVSpine-V4` | `rocmfp4.laguna.moe.strixkvspine.v4` |
 | `Step-3.7-Flash-ROCmFPX-Q3-QualityPlus-*.gguf` | `jcbtc/Step-3.7-Flash-ROCmFPX-Q3-QualityPlus` | `rocmfpx-q3.step35.moe.qualityplus.v1` |
 | `Qwen3.6-35B-A3B-NSC-ACE-SABER-MTP-F16-to-ROCmFP4-STRIX_LEAN.gguf` | `jcbtc/chadrock-35b-ace-saber-rocmfp4-mtp` | `rocmfp4.qwen35.moe.strix-lean.v1` |
 | `CHADROCK-35B-Ace-Saber-MTP-ROCmFPX-MoEQuality-7.07BPW.gguf` | `jcbtc/chadrock-35b-ace-saber-rocmfp4-mtp` | `rocmfpx.qwen35.moe.moequality.v1` |
@@ -87,3 +88,4 @@ Recipe-specific notes:
 - [Qwen35 dense UltraQuality](qwable-ultraquality-7p61bpw-rankleave32.md)
 - [Qwen35 MoE MoEQuality](qwen35-moe-rocmfpx-moequality.md)
 - [Step35 MoE Q3 QualityPlus](step35-rocmfpx-q3-qualityplus.md)
+- [Laguna S 2.1 StrixKVSpine V4](laguna-s21-chadrock-rocmfp4-strixkvspine-v4.md)

@@ -20,6 +20,7 @@ FIELDS = [
 ]
 
 CONTRACTS = {
+    "laguna": "moe",
     "qwen35": "dense",
     "qwen35moe": "moe",
     "step35": "moe",

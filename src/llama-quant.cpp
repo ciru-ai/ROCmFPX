@@ -1371,6 +1371,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
     }
 
+    if (params->chat_template) {
+        gguf_set_val_str(ctx_out.get(), "tokenizer.chat_template", params->chat_template);
+    }
+
     std::map<int, std::string> mapped;
     int blk_id = 0;
 
@@ -1726,7 +1730,8 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
-        /*.prune_layers                =*/ nullptr
+        /*.prune_layers                =*/ nullptr,
+        /*.chat_template               =*/ nullptr
     };
 
     return result;

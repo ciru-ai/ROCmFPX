@@ -435,6 +435,7 @@ extern "C" {
         const struct llama_model_kv_override * kv_overrides;        // pointer to kv overrides
         const struct llama_model_tensor_override * tt_overrides;    // pointer to tensor overrides
         const int32_t * prune_layers;                               // pointer to layer indices to prune
+        const char * chat_template;                                 // optional full chat template to embed in the output GGUF
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {
