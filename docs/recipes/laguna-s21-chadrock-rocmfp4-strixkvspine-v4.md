@@ -22,15 +22,71 @@ this ROCmFPX branch rather than stock llama.cpp.
 Smaller contexts can be selected through `CTX_SIZE` when less memory is
 available.
 
-## Build
+## Linux support
 
-Install the standard build tools and Vulkan shader compiler on Ubuntu:
+The production runtime is built from portable Linux source rather than a
+distro-specific binary.
+
+| Distribution | Installation path | Validation status |
+| --- | --- | --- |
+| Ubuntu 24.04 LTS / Debian 12+ | Native `apt` packages | Primary documented path |
+| Fedora 42+ | Native `dnf` packages | Supported build path |
+| Arch / Manjaro | Native `pacman` packages | Supported build path |
+| NixOS | Native Nix packages | Production build validated |
+
+The helper detects these Linux families, prints the exact package-manager
+commands by default, and installs them only when explicitly requested:
+
+```bash
+scripts/install-laguna-vulkan-deps.sh
+scripts/install-laguna-vulkan-deps.sh --install
+```
+
+Manual commands:
+
+### Ubuntu, Debian, Linux Mint, and Pop!_OS
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y git cmake ninja-build build-essential glslc \
-  libvulkan-dev vulkan-tools spirv-headers
+sudo apt-get install -y \
+  git cmake ninja-build build-essential glslc \
+  libvulkan-dev vulkan-tools spirv-headers mesa-vulkan-drivers
 ```
+
+### Fedora, Rocky Linux, and AlmaLinux
+
+```bash
+sudo dnf install -y \
+  git cmake ninja-build gcc gcc-c++ glslc \
+  vulkan-loader-devel vulkan-headers spirv-headers \
+  vulkan-tools mesa-vulkan-drivers
+```
+
+### Arch, Manjaro, and EndeavourOS
+
+```bash
+sudo pacman -S --needed \
+  git cmake ninja base-devel shaderc \
+  vulkan-icd-loader vulkan-headers spirv-headers \
+  vulkan-tools vulkan-radeon
+```
+
+### NixOS
+
+```bash
+nix --extra-experimental-features 'nix-command flakes' profile add \
+  nixpkgs#git nixpkgs#cmake nixpkgs#ninja nixpkgs#gcc \
+  nixpkgs#shaderc nixpkgs#vulkan-headers nixpkgs#vulkan-loader \
+  nixpkgs#spirv-headers
+```
+
+Confirm that Linux can see the AMD Vulkan device:
+
+```bash
+vulkaninfo --summary
+```
+
+## Build
 
 Clone the release branch and build a static Vulkan runtime:
 

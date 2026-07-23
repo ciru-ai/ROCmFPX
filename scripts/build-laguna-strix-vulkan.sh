@@ -7,17 +7,29 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build-laguna-strix-vulkan}"
 JOBS="${JOBS:-$(nproc)}"
 
+if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
+    echo "this production build currently targets Linux x86-64" >&2
+    exit 1
+fi
+
 if ! command -v cmake >/dev/null 2>&1; then
     echo "cmake is required" >&2
+    echo "run: scripts/install-laguna-vulkan-deps.sh --install" >&2
     exit 1
 fi
 if ! command -v ninja >/dev/null 2>&1; then
     echo "ninja is required" >&2
+    echo "run: scripts/install-laguna-vulkan-deps.sh --install" >&2
     exit 1
 fi
 if ! command -v glslc >/dev/null 2>&1; then
-    echo "glslc is required (Ubuntu package: glslc)" >&2
+    echo "glslc is required" >&2
+    echo "run: scripts/install-laguna-vulkan-deps.sh --install" >&2
     exit 1
+fi
+
+if [[ -z "${CMAKE_PREFIX_PATH:-}" && -d "${HOME:-}/.nix-profile" ]]; then
+    export CMAKE_PREFIX_PATH="${HOME}/.nix-profile"
 fi
 
 cmake -S "$ROOT" -B "$BUILD_DIR" -G Ninja \
