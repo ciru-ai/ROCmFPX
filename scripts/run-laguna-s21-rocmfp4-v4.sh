@@ -4,22 +4,82 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RUNTIME_RELEASE="V2"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build-laguna-strix-vulkan}"
-BIN="${BIN:-$BUILD_DIR/bin/llama-server}"
+BIN="${BIN:-${6:-$BUILD_DIR/bin/llama-server}}"
 MODEL="${MODEL:-${1:-}}"
-HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-8080}"
-ALIAS="${ALIAS:-laguna-s21-rocmfp4-strixkvspine-v4}"
+HOST="${HOST:-${3:-127.0.0.1}}"
+PORT="${PORT:-${4:-8080}}"
+ALIAS="${ALIAS:-${2:-laguna-s21-rocmfp4-strixkvspine-v4}}"
 DEVICE="${DEVICE:-Vulkan0}"
-CTX_SIZE="${CTX_SIZE:-262144}"
+STABILITY_MODE="${STABILITY_MODE:-safe}"
 BATCH_SIZE="${BATCH_SIZE:-2048}"
-UBATCH_SIZE="${UBATCH_SIZE:-512}"
 THREADS="${THREADS:-16}"
 THREADS_BATCH="${THREADS_BATCH:-16}"
+FLASH_ATTN="${FLASH_ATTN:-on}"
+SPLIT_MODE="${SPLIT_MODE:-row}"
+
+case "$STABILITY_MODE" in
+    safe)
+        CTX_SIZE="${CTX_SIZE:-${5:-131072}}"
+        UBATCH_SIZE="${UBATCH_SIZE:-512}"
+        VK_MAX_NODES_PER_SUBMIT="${VK_MAX_NODES_PER_SUBMIT:-10}"
+        VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH="${VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH:-4}"
+        ;;
+    performance)
+        CTX_SIZE="${CTX_SIZE:-${5:-262144}}"
+        UBATCH_SIZE="${UBATCH_SIZE:-512}"
+        VK_MAX_NODES_PER_SUBMIT="${VK_MAX_NODES_PER_SUBMIT:-32}"
+        VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH="${VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH:-0}"
+        ;;
+    custom)
+        : "${CTX_SIZE:?CTX_SIZE is required with STABILITY_MODE=custom}"
+        : "${UBATCH_SIZE:?UBATCH_SIZE is required with STABILITY_MODE=custom}"
+        : "${VK_MAX_NODES_PER_SUBMIT:?VK_MAX_NODES_PER_SUBMIT is required with STABILITY_MODE=custom}"
+        : "${VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH:?VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH is required with STABILITY_MODE=custom}"
+        ;;
+    *)
+        echo "invalid STABILITY_MODE: $STABILITY_MODE (expected safe, performance, or custom)" >&2
+        exit 2
+        ;;
+esac
+
+for numeric_setting in CTX_SIZE BATCH_SIZE UBATCH_SIZE THREADS THREADS_BATCH VK_MAX_NODES_PER_SUBMIT; do
+    numeric_value="${!numeric_setting}"
+    if [[ ! "$numeric_value" =~ ^[1-9][0-9]*$ ]]; then
+        echo "$numeric_setting must be a positive integer, got: $numeric_value" >&2
+        exit 2
+    fi
+done
+
+if [[ ! "$VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH" =~ ^[0-9]+$ ]]; then
+    echo "VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH must be a non-negative integer, got: $VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH" >&2
+    exit 2
+fi
+
+case "$FLASH_ATTN" in
+    on|off) ;;
+    *)
+        echo "FLASH_ATTN must be on or off, got: $FLASH_ATTN" >&2
+        exit 2
+        ;;
+esac
+
+case "$SPLIT_MODE" in
+    none|layer|row) ;;
+    *)
+        echo "SPLIT_MODE must be none, layer, or row, got: $SPLIT_MODE" >&2
+        exit 2
+        ;;
+esac
+
+export GGML_VK_MAX_NODES_PER_SUBMIT="$VK_MAX_NODES_PER_SUBMIT"
+export GGML_VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH="$VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH"
 
 if [[ -z "$MODEL" ]]; then
     echo "usage: MODEL=/path/to/laguna-v4.gguf $0" >&2
     echo "   or: $0 /path/to/laguna-v4.gguf" >&2
+    echo "   or as BACKEND_LAUNCH_SCRIPT: $0 MODEL ALIAS HOST PORT CTX BIN" >&2
     exit 2
 fi
 if [[ ! -r "$MODEL" ]]; then
@@ -53,8 +113,8 @@ server_args=(
     --parallel 1 \
     --n-gpu-layers 999 \
     --device "$DEVICE" \
-    --split-mode row \
-    --flash-attn on \
+    --split-mode "$SPLIT_MODE" \
+    --flash-attn "$FLASH_ATTN" \
     --cache-type-k f16 \
     --cache-type-v f16 \
     --batch-size "$BATCH_SIZE" \
@@ -74,6 +134,18 @@ server_args=(
     --spec-type none \
     --metrics
 )
+
+echo "Laguna Vulkan stability settings:" >&2
+echo "  runtime_release=$RUNTIME_RELEASE" >&2
+echo "  mode=$STABILITY_MODE context=$CTX_SIZE batch=$BATCH_SIZE ubatch=$UBATCH_SIZE" >&2
+echo "  flash_attn=$FLASH_ATTN split_mode=$SPLIT_MODE max_nodes_per_submit=$VK_MAX_NODES_PER_SUBMIT" >&2
+echo "  fa_max_workgroups_x_per_dispatch=$VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH" >&2
+echo "  binary=$BIN" >&2
+echo "  binary_sha256=$(sha256sum "$BIN" | awk '{print $1}')" >&2
+
+if [[ "$STABILITY_MODE" == "performance" ]]; then
+    echo "  WARNING: the 256K performance lane is experimental and has not passed the V2 full-depth stability gate" >&2
+fi
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
     printf '%q ' "$BIN" "${server_args[@]}"
