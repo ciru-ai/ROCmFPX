@@ -1202,7 +1202,6 @@ common_init_result::common_init_result(common_params & params) :
         lora.reset(llama_adapter_lora_init(model, la.path.c_str()));
         if (lora == nullptr) {
             LOG_ERR("%s: failed to load lora adapter '%s'\n", __func__, la.path.c_str());
-            pimpl->model.reset(model);
             return;
         }
 
