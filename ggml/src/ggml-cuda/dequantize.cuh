@@ -111,6 +111,31 @@ static __device__ __forceinline__ int rocmfpx_decode_fp6_code_cuda(const uint32_
     return (code & 32u) ? -(mag == 0 ? 32 : mag) : mag;
 }
 
+static __device__ __forceinline__ int rocmfpx_decode_q7_code_cuda(
+        const uint8_t * qs, const int i) {
+    const int group = i / QG_ROCMFP7;
+    const int local = i % QG_ROCMFP7;
+    const int bit_pos = local * 7;
+    const int byte_pos = bit_pos >> 3;
+    const int shift = bit_pos & 7;
+    const uint8_t * payload = qs + group * QS_ROCMFP7_GROUP;
+
+    uint32_t window = payload[byte_pos];
+    if (byte_pos + 1 < QS_ROCMFP7_GROUP) {
+        window |= (uint32_t) payload[byte_pos + 1] << 8;
+    }
+
+    const uint32_t code = (window >> shift) & 0x7fu;
+    return (int) (code ^ 0x40u) - 0x40;
+}
+
+static __device__ __forceinline__ float rocmfpx_q7_scale_cuda(
+        const block_rocmfp7 & block, const int group) {
+    half scale;
+    memcpy(&scale, &block.d[group], sizeof(scale));
+    return __half2float(scale);
+}
+
 static __device__ __forceinline__ void dequantize_rocmfpx_fp3(const void * vx, const int64_t ib, const int iqs, float2 & v) {
     const block_rocmfp3 * x = (const block_rocmfp3 *) vx;
 
@@ -141,6 +166,18 @@ static __device__ __forceinline__ void dequantize_rocmfpx_fp8(const void * vx, c
     const float d = rocmfpx_ue4m3_to_fp32_finite(x[ib].e);
     v.x = d * (float) x[ib].qs[iqs + 0];
     v.y = d * (float) x[ib].qs[iqs + 1];
+}
+
+static __device__ __forceinline__ void dequantize_rocmfpx_q7(
+        const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_rocmfp7 * x = (const block_rocmfp7 *) vx;
+    const int i0 = iqs + 0;
+    const int i1 = iqs + 1;
+    const float d0 = rocmfpx_q7_scale_cuda(x[ib], i0 / QG_ROCMFP7);
+    const float d1 = rocmfpx_q7_scale_cuda(x[ib], i1 / QG_ROCMFP7);
+
+    v.x = d0 * (float) rocmfpx_decode_q7_code_cuda(x[ib].qs, i0);
+    v.y = d1 * (float) rocmfpx_decode_q7_code_cuda(x[ib].qs, i1);
 }
 
 static __device__ __forceinline__ void dequantize_q5_0(const void * vx, const int64_t ib, const int iqs, float2 & v){

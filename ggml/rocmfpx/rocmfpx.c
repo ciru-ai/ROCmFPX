@@ -148,6 +148,11 @@ size_t rocmfpx_row_size_fp8(int64_t k) {
     return (size_t) (k / QK_ROCMFP8) * sizeof(block_rocmfp8);
 }
 
+size_t rocmfpx_row_size_fp7(int64_t k) {
+    assert(k % QK_ROCMFP7 == 0);
+    return (size_t) (k / QK_ROCMFP7) * sizeof(block_rocmfp7);
+}
+
 
 
 static float rocmfpx_max_abs(const float * x, int n) {
@@ -1070,6 +1075,234 @@ size_t rocmfpx_quantize_fp8(const float * GGML_RESTRICT src, void * GGML_RESTRIC
     return (size_t) nrows * row_size;
 }
 
+// ---------------------------------------------------------------------------
+// Q7-DOT32 macroblock
+//
+// Each 32-value group is a 224-bit, LSB-first stream of signed 7-bit two's
+// complement integers. Eight groups form a 256-value macroblock. Keeping all
+// eight 28-byte payloads ahead of the FP16 scale table makes every payload
+// group 4-byte aligned without adding padding.
+// ---------------------------------------------------------------------------
+
+static inline void rocmfpx_fp7_pack8(uint8_t * dst, const int8_t * src) {
+    uint64_t bits = 0;
+    for (int i = 0; i < 8; ++i) {
+        bits |= ((uint64_t) ((uint8_t) src[i] & 0x7fu)) << (7*i);
+    }
+    for (int i = 0; i < 7; ++i) {
+        dst[i] = (uint8_t) (bits >> (8*i));
+    }
+}
+
+static inline void rocmfpx_fp7_unpack8(const uint8_t * src, int8_t * dst) {
+    uint64_t bits = 0;
+    for (int i = 0; i < 7; ++i) {
+        bits |= ((uint64_t) src[i]) << (8*i);
+    }
+    for (int i = 0; i < 8; ++i) {
+        const uint8_t code = (uint8_t) ((bits >> (7*i)) & 0x7fu);
+        dst[i] = (int8_t) ((code & 0x40u) ? (int) code - 128 : (int) code);
+    }
+}
+
+static inline int rocmfpx_fp7_code(float value, float inv_scale) {
+    if (!isfinite(value) || inv_scale == 0.0f || !isfinite(inv_scale)) {
+        return 0;
+    }
+    int q = (int) roundf(value * inv_scale);
+    q = q < -64 ? -64 : q;
+    q = q >  63 ?  63 : q;
+    return q;
+}
+
+static inline float rocmfpx_fp7_weight(const float * quant_weights, int i) {
+    if (!quant_weights) {
+        return 1.0f;
+    }
+    return isfinite(quant_weights[i]) && quant_weights[i] > 0.0f ? quant_weights[i] : 0.0f;
+}
+
+// Assign codes using a clipping seed, solve the optimal scale for those codes,
+// round that scale to the exact FP16 wire representation, then score the
+// reconstruction that inference will consume.
+static float rocmfpx_fp7_fit_seed(
+        const float * x, const float * quant_weights, float seed,
+        int8_t * codes, ggml_fp16_t * fitted_scale) {
+    if (seed == 0.0f || !isfinite(seed)) {
+        return INFINITY;
+    }
+
+    const float inv_seed = 1.0f / seed;
+    float num = 0.0f;
+    float den = 0.0f;
+
+    for (int i = 0; i < QG_ROCMFP7; ++i) {
+        const float value = isfinite(x[i]) ? x[i] : 0.0f;
+        const int q = rocmfpx_fp7_code(value, inv_seed);
+        const float weight = rocmfpx_fp7_weight(quant_weights, i);
+        num += weight*value*(float) q;
+        den += weight*(float) (q*q);
+        codes[i] = (int8_t) q;
+    }
+
+    if (!(den > 0.0f)) {
+        return INFINITY;
+    }
+
+    *fitted_scale = ggml_fp32_to_fp16(num / den);
+    const float stored_scale = ggml_fp16_to_fp32(*fitted_scale);
+    if (stored_scale == 0.0f || !isfinite(stored_scale)) {
+        return INFINITY;
+    }
+
+    float err = 0.0f;
+    for (int i = 0; i < QG_ROCMFP7; ++i) {
+        const float value = isfinite(x[i]) ? x[i] : 0.0f;
+        const float delta = value - stored_scale*(float) codes[i];
+        err += rocmfpx_fp7_weight(quant_weights, i)*delta*delta;
+    }
+    return err;
+}
+
+static ggml_fp16_t rocmfpx_fp7_quantize_group(
+        const float * x, const float * quant_weights, int8_t * best_codes) {
+    // Keep underflow-to-zero groups deterministic even when every candidate
+    // FP16 scale rounds to zero and therefore has infinite fitted error.
+    memset(best_codes, 0, QG_ROCMFP7);
+
+    float signed_amax = 0.0f;
+    for (int i = 0; i < QG_ROCMFP7; ++i) {
+        if (!isfinite(x[i])) {
+            continue;
+        }
+        if (fabsf(x[i]) > fabsf(signed_amax)) {
+            signed_amax = x[i];
+        }
+    }
+
+    if (signed_amax == 0.0f || !isfinite(signed_amax)) {
+        memset(best_codes, 0, QG_ROCMFP7);
+        return ggml_fp32_to_fp16(0.0f);
+    }
+
+    // Orient the signed scale so the largest-magnitude value uses Q7's extra
+    // negative endpoint (-64). Search a compact clipping range, solve each
+    // code assignment by least squares, and score after FP16 rounding.
+    ggml_fp16_t best_scale = ggml_fp32_to_fp16(-signed_amax / 64.0f);
+    float best_err = INFINITY;
+    int best_denom = 64;
+    int8_t trial_codes[QG_ROCMFP7];
+
+    for (int denom = 52; denom <= 65; ++denom) {
+        ggml_fp16_t trial_scale;
+        const float seed = -signed_amax / (float) denom;
+        const float err = rocmfpx_fp7_fit_seed(
+            x, quant_weights, seed, trial_codes, &trial_scale);
+        if (err < best_err) {
+            best_err = err;
+            best_scale = trial_scale;
+            best_denom = denom;
+            memcpy(best_codes, trial_codes, sizeof(trial_codes));
+        }
+    }
+
+    static const float fine_offsets[4] = { -0.50f, -0.25f, 0.25f, 0.50f };
+    for (size_t i = 0; i < sizeof(fine_offsets)/sizeof(fine_offsets[0]); ++i) {
+        ggml_fp16_t trial_scale;
+        const float denom = (float) best_denom + fine_offsets[i];
+        const float seed = -signed_amax / denom;
+        const float err = rocmfpx_fp7_fit_seed(
+            x, quant_weights, seed, trial_codes, &trial_scale);
+        if (err < best_err) {
+            best_err = err;
+            best_scale = trial_scale;
+            memcpy(best_codes, trial_codes, sizeof(trial_codes));
+        }
+    }
+
+    if (!isfinite(best_err)) {
+        if (quant_weights) {
+            return rocmfpx_fp7_quantize_group(x, NULL, best_codes);
+        }
+        return ggml_fp32_to_fp16(0.0f);
+    }
+
+    return best_scale;
+}
+
+static void rocmfpx_quantize_row_fp7_impl(
+        const float * GGML_RESTRICT x, block_rocmfp7 * GGML_RESTRICT y,
+        int64_t k, const float * GGML_RESTRICT quant_weights) {
+    assert(k % QK_ROCMFP7 == 0);
+
+    const int64_t nb = k / QK_ROCMFP7;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const float * xb = x + ib*QK_ROCMFP7;
+        const float * wb = quant_weights ? quant_weights + ib*QK_ROCMFP7 : NULL;
+        block_rocmfp7 * yb = y + ib;
+
+        for (int group = 0; group < NG_ROCMFP7; ++group) {
+            int8_t codes[QG_ROCMFP7];
+            const float * xg = xb + group*QG_ROCMFP7;
+            const float * wg = wb ? wb + group*QG_ROCMFP7 : NULL;
+            yb->d[group] = rocmfpx_fp7_quantize_group(xg, wg, codes);
+
+            uint8_t * qg = yb->qs + group*QS_ROCMFP7_GROUP;
+            for (int pack = 0; pack < QG_ROCMFP7/8; ++pack) {
+                rocmfpx_fp7_pack8(qg + pack*7, codes + pack*8);
+            }
+        }
+    }
+}
+
+void rocmfpx_quantize_row_fp7_ref(
+        const float * GGML_RESTRICT x, block_rocmfp7 * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_quantize_row_fp7_impl(x, y, k, NULL);
+}
+
+void rocmfpx_dequantize_row_fp7(
+        const block_rocmfp7 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_ROCMFP7 == 0);
+
+    const int64_t nb = k / QK_ROCMFP7;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const block_rocmfp7 * xb = x + ib;
+        float * yb = y + ib*QK_ROCMFP7;
+
+        for (int group = 0; group < NG_ROCMFP7; ++group) {
+            const uint8_t * qg = xb->qs + group*QS_ROCMFP7_GROUP;
+            const float scale = ggml_fp16_to_fp32(xb->d[group]);
+            for (int pack = 0; pack < QG_ROCMFP7/8; ++pack) {
+                int8_t codes[8];
+                rocmfpx_fp7_unpack8(qg + pack*7, codes);
+                for (int i = 0; i < 8; ++i) {
+                    yb[group*QG_ROCMFP7 + pack*8 + i] = scale*(float) codes[i];
+                }
+            }
+        }
+    }
+}
+
+void rocmfpx_quantize_row_fp7(
+        const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_quantize_row_fp7_ref(x, (block_rocmfp7 *) y, k);
+}
+
+size_t rocmfpx_quantize_fp7(
+        const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+        int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    const size_t row_size = rocmfpx_row_size_fp7(n_per_row);
+    char * qrow = (char *) dst;
+
+    for (int64_t row = 0; row < nrows; ++row) {
+        rocmfpx_quantize_row_fp7_impl(
+            src + row*n_per_row, (block_rocmfp7 *) qrow, n_per_row, imatrix);
+        qrow += row_size;
+    }
+
+    return (size_t) nrows*row_size;
+}
+
 bool rocmfpx_validate_row_data_fp3(const void * data, size_t nbytes) {
     if (nbytes % sizeof(block_rocmfp3) != 0) {
         return false;
@@ -1115,6 +1348,25 @@ bool rocmfpx_validate_row_data_fp8(const void * data, size_t nbytes) {
     for (size_t i = 0; i < nb; ++i) {
         if (!rocmfpx_scale_is_valid(blocks[i].e)) {
             return false;
+        }
+    }
+
+    return true;
+}
+
+bool rocmfpx_validate_row_data_fp7(const void * data, size_t nbytes) {
+    if (nbytes % sizeof(block_rocmfp7) != 0) {
+        return false;
+    }
+
+    const block_rocmfp7 * blocks = (const block_rocmfp7 *) data;
+    const size_t nb = nbytes / sizeof(block_rocmfp7);
+    for (size_t ib = 0; ib < nb; ++ib) {
+        for (int group = 0; group < NG_ROCMFP7; ++group) {
+            const float scale = ggml_fp16_to_fp32(blocks[ib].d[group]);
+            if (!isfinite(scale)) {
+                return false;
+            }
         }
     }
 

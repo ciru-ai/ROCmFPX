@@ -233,6 +233,10 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_q<QK_ROCMFP8, QR_ROCMFP8, dequantize_rocmfpx_fp8>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
+        case GGML_TYPE_Q7_0_ROCMFPX:
+            get_rows_cuda_q<QK_ROCMFP7, QR_ROCMFP7, dequantize_rocmfpx_q7>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
         default:
             // TODO: k-quants
             GGML_ABORT("%s: unsupported src0 type: %s\n", __func__, ggml_type_name(src0_type));

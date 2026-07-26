@@ -362,6 +362,10 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
 #define GGML_ROCMFP8_Q8_1_MMVQ_VDR 2
 #endif
 
+#ifndef GGML_ROCMFP7_Q8_1_MMVQ_VDR
+#define GGML_ROCMFP7_Q8_1_MMVQ_VDR 8
+#endif
+
 #if GGML_ROCMFP3_Q8_1_MMVQ_VDR != 1 && \
     GGML_ROCMFP3_Q8_1_MMVQ_VDR != 2 && \
     GGML_ROCMFP3_Q8_1_MMVQ_VDR != 4 && \
@@ -383,9 +387,14 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
 #error "GGML_ROCMFP8_Q8_1_MMVQ_VDR must be 1, 2, 4, or 8"
 #endif
 
+#if GGML_ROCMFP7_Q8_1_MMVQ_VDR != 8
+#error "GGML_ROCMFP7_Q8_1_MMVQ_VDR must be 8 for one aligned Q7 group per lane"
+#endif
+
 #define VDR_ROCMFP3_Q8_1_MMVQ GGML_ROCMFP3_Q8_1_MMVQ_VDR
 #define VDR_ROCMFP6_Q8_1_MMVQ GGML_ROCMFP6_Q8_1_MMVQ_VDR
 #define VDR_ROCMFP8_Q8_1_MMVQ GGML_ROCMFP8_Q8_1_MMVQ_VDR
+#define VDR_ROCMFP7_Q8_1_MMVQ GGML_ROCMFP7_Q8_1_MMVQ_VDR
 
 #define VDR_ROCMFP3_Q8_1_MMQ 4
 #define VDR_ROCMFP6_Q8_1_MMQ 4
@@ -577,6 +586,107 @@ static __device__ __forceinline__ float vec_dot_rocmfpx_fp8_q8_1(
 
     return vec_dot_q8_0_q8_1_impl<float, VDR_ROCMFP8_Q8_1_MMVQ>(
         v, u, rocmfpx_ue4m3_to_fp32_finite(bq8->e), __low2half(bq8_1->ds));
+}
+
+#if defined(GGML_ROCMFP7_TRISLOPE_DECODE_PROBE)
+static __device__ __constant__ int8_t
+    rocmfpx_q7_trislope_l4_c20_table[128] = {
+        -128, -124, -120, -116, -112, -108, -104, -100,
+         -96,  -92,  -88,  -86,  -84,  -82,  -80,  -78,
+         -76,  -74,  -72,  -70,  -68,  -66,  -64,  -62,
+         -60,  -58,  -56,  -54,  -52,  -50,  -48,  -46,
+         -44,  -42,  -40,  -38,  -36,  -34,  -32,  -30,
+         -28,  -26,  -24,  -22,  -20,  -19,  -18,  -17,
+         -16,  -15,  -14,  -13,  -12,  -11,  -10,   -9,
+          -8,   -7,   -6,   -5,   -4,   -3,   -2,   -1,
+           0,    1,    2,    3,    4,    5,    6,    7,
+           8,    9,   10,   11,   12,   13,   14,   15,
+          16,   17,   18,   19,   21,   23,   25,   27,
+          29,   31,   33,   35,   37,   39,   41,   43,
+          45,   47,   49,   51,   53,   55,   57,   59,
+          61,   63,   65,   67,   69,   71,   73,   75,
+          77,   79,   81,   83,   85,   87,   91,   95,
+          99,  103,  107,  111,  115,  119,  123,  127,
+    };
+#endif
+
+static __device__ __forceinline__ uint32_t rocmfpx_spread_q7_to_i8_cuda(
+        uint32_t packed28) {
+    uint32_t bytes =
+        (packed28 & 0x0000007fu) |
+        ((packed28 & 0x00003f80u) << 1) |
+        ((packed28 & 0x001fc000u) << 2) |
+        ((packed28 & 0x0fe00000u) << 3);
+
+#if defined(GGML_ROCMFP7_TRISLOPE_DECODE_PROBE)
+    // Performance probe for the 128-entry, INT8-native tri-slope codebook.
+    // The packed Q7 fields are treated as unsigned indices.  The map has
+    // strides 4/2/1/2/4 and can be decoded arithmetically without a LUT:
+    //   index [  0, 10] -> [-128, -88], stride 4
+    //   index [ 10, 44] -> [ -88, -20], stride 2
+    //   index [ 44, 83] -> [ -20,  19], stride 1
+    //   index [ 83,117] -> [  19,  87], stride 2
+    //   index [117,127] -> [  87, 127], stride 4
+    uint32_t mapped = 0;
+#pragma unroll
+    for (int lane = 0; lane < 4; ++lane) {
+        const int index = (bytes >> (8 * lane)) & 0x7f;
+        const int value =
+            (int) rocmfpx_q7_trislope_l4_c20_table[index];
+        mapped |= ((uint32_t) (uint8_t) (int8_t) value) << (8 * lane);
+    }
+    return mapped;
+#else
+    bytes |= (bytes & 0x40404040u) << 1;
+    return bytes;
+#endif
+}
+
+template <int chunk>
+static __device__ __forceinline__ int rocmfpx_unpack_q7_dot4_cuda(
+        const uint32_t * words) {
+    static_assert(chunk >= 0 && chunk < 8, "Q7 dot4 chunk out of range");
+    constexpr int bit = chunk * 28;
+    constexpr int word = bit / 32;
+    constexpr int shift = bit % 32;
+    uint32_t packed28;
+    if constexpr (shift == 0) {
+        packed28 = words[word];
+    } else if constexpr (word == 6) {
+        packed28 = words[word] >> shift;
+    } else {
+        packed28 = (words[word] >> shift) |
+                   (words[word + 1] << (32 - shift));
+    }
+    return (int) rocmfpx_spread_q7_to_i8_cuda(packed28 & 0x0fffffffu);
+}
+
+static __device__ __forceinline__ float vec_dot_rocmfpx_q7_q8_1(
+        const void * __restrict__ vbq,
+        const block_q8_1 * __restrict__ bq8_1,
+        const int & kbx,
+        const int & iqs) {
+    const block_rocmfp7 * bq7 = (const block_rocmfp7 *) vbq + kbx;
+    const int group = iqs / VDR_ROCMFP7_Q8_1_MMVQ;
+    const uint8_t * payload = bq7->qs + group * QS_ROCMFP7_GROUP;
+
+    // block_rocmfp7 is 240 bytes and every payload starts at 28-byte
+    // increments, so this pointer is physically four-byte aligned.
+    const uint32_t * words = (const uint32_t *) payload;
+    const block_q8_1 * bq8 = bq8_1 + group;
+    int sumi = 0;
+    sumi = ggml_cuda_dp4a(rocmfpx_unpack_q7_dot4_cuda<0>(words), get_int_b4(bq8->qs, 0), sumi);
+    sumi = ggml_cuda_dp4a(rocmfpx_unpack_q7_dot4_cuda<1>(words), get_int_b4(bq8->qs, 1), sumi);
+    sumi = ggml_cuda_dp4a(rocmfpx_unpack_q7_dot4_cuda<2>(words), get_int_b4(bq8->qs, 2), sumi);
+    sumi = ggml_cuda_dp4a(rocmfpx_unpack_q7_dot4_cuda<3>(words), get_int_b4(bq8->qs, 3), sumi);
+    sumi = ggml_cuda_dp4a(rocmfpx_unpack_q7_dot4_cuda<4>(words), get_int_b4(bq8->qs, 4), sumi);
+    sumi = ggml_cuda_dp4a(rocmfpx_unpack_q7_dot4_cuda<5>(words), get_int_b4(bq8->qs, 5), sumi);
+    sumi = ggml_cuda_dp4a(rocmfpx_unpack_q7_dot4_cuda<6>(words), get_int_b4(bq8->qs, 6), sumi);
+    sumi = ggml_cuda_dp4a(rocmfpx_unpack_q7_dot4_cuda<7>(words), get_int_b4(bq8->qs, 7), sumi);
+
+    half scale;
+    memcpy(&scale, &bq7->d[group], sizeof(scale));
+    return __half2float(scale) * __low2float(bq8->ds) * (float) sumi;
 }
 
 #define VDR_NVFP4_Q8_1_MMVQ 4

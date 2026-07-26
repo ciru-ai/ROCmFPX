@@ -231,6 +231,16 @@ static inline int ggml_rocmfpx_decode_fp6_cpu(uint32_t code) {
     return (code & 32u) ? -(mag == 0 ? 32 : mag) : mag;
 }
 
+static inline int ggml_rocmfpx_decode_fp7_cpu(const uint8_t * src, int index) {
+    const int bit_pos = 7*index;
+    const int byte_pos = bit_pos >> 3;
+    const int shift = bit_pos & 7;
+    const uint16_t bits = (uint16_t) src[byte_pos] |
+        (byte_pos + 1 < QS_ROCMFP7_GROUP ? (uint16_t) src[byte_pos + 1] << 8 : 0);
+    const uint8_t code = (uint8_t) ((bits >> shift) & 0x7fu);
+    return (code & 0x40u) ? (int) code - 128 : (int) code;
+}
+
 static void ggml_vec_dot_rocmfpx_fp3_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     GGML_UNUSED(bs);
     GGML_UNUSED(bx);
@@ -332,6 +342,37 @@ static void ggml_vec_dot_rocmfpx_fp8_q8_0(int n, float * GGML_RESTRICT s, size_t
     *s = sumf;
 }
 
+static void ggml_vec_dot_rocmfpx_fp7_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    assert(nrc == 1);
+    GGML_UNUSED(nrc);
+    assert(n % QK_ROCMFP7 == 0);
+    assert(QK_ROCMFP7 == NG_ROCMFP7*QK8_0);
+
+    const block_rocmfp7 * GGML_RESTRICT x = (const block_rocmfp7 *) vx;
+    const block_q8_0    * GGML_RESTRICT y = (const block_q8_0 *) vy;
+
+    const int nb = n / QK_ROCMFP7;
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        for (int group = 0; group < NG_ROCMFP7; ++group) {
+            const uint8_t * qg = x[ib].qs + group*QS_ROCMFP7_GROUP;
+            const block_q8_0 * yg = y + ib*NG_ROCMFP7 + group;
+            int sumi = 0;
+            for (int j = 0; j < QG_ROCMFP7; ++j) {
+                sumi += ggml_rocmfpx_decode_fp7_cpu(qg, j)*(int) yg->qs[j];
+            }
+            sumf += GGML_CPU_FP16_TO_FP32(x[ib].d[group]) *
+                    GGML_CPU_FP16_TO_FP32(yg->d) * (float) sumi;
+        }
+    }
+
+    *s = sumf;
+}
+
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
@@ -388,6 +429,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_Q8_0_ROCMFPX] = {
         .from_float               = rocmfpx_quantize_row_fp8,
         .vec_dot                  = ggml_vec_dot_rocmfpx_fp8_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q7_0_ROCMFPX] = {
+        .from_float               = rocmfpx_quantize_row_fp7,
+        .vec_dot                  = ggml_vec_dot_rocmfpx_fp7_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },

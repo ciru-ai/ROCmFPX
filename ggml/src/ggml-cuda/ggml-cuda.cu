@@ -31,6 +31,8 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/q7-panel16-cache.cuh"
+#include "ggml-cuda/q7-q8-view-cache.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -65,6 +67,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml.h"
+#include "../../rocmfpx/q7-q8-view.h"
 
 #include <algorithm>
 #include <array>
@@ -80,6 +83,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -658,10 +662,349 @@ struct ggml_backend_cuda_device_context {
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 };
 
+static size_t ggml_cuda_canonical_alloc_size(const ggml_tensor * tensor) {
+    size_t size = ggml_nbytes(tensor);
+    const int64_t ne0 = tensor->ne[0];
+
+    if (ggml_is_quantized(tensor->type) && ne0 % MATRIX_ROW_PADDING != 0) {
+        GGML_ASSERT(tensor->nb[0] == ggml_element_size(tensor));
+        size += ggml_row_size(
+            tensor->type,
+            MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
+    }
+
+    return size;
+}
+
+static bool ggml_cuda_q7_weight_name(const char * name) {
+    if (name == nullptr) {
+        return false;
+    }
+    constexpr const char suffix[] = ".weight";
+    const size_t name_length = std::strlen(name);
+    return
+        name_length >= sizeof(suffix) - 1 &&
+        std::strcmp(
+            name + name_length - (sizeof(suffix) - 1),
+            suffix) == 0;
+}
+
+static bool ggml_cuda_q7_layer_name(
+        const char * name,
+        const char * suffix) {
+    if (name == nullptr || std::strncmp(name, "blk.", 4) != 0) {
+        return false;
+    }
+
+    const char * cursor = name + 4;
+    if (*cursor < '0' || *cursor > '9') {
+        return false;
+    }
+    while (*cursor >= '0' && *cursor <= '9') {
+        ++cursor;
+    }
+
+    return std::strcmp(cursor, suffix) == 0;
+}
+
+static bool ggml_cuda_q7_q8_view_qwen_mmq_weight_name(
+        const char * name) {
+    if (name == nullptr) {
+        return false;
+    }
+    if (std::strcmp(name, "output.weight") == 0) {
+        return ggml_cuda_q7_q8_view_includes_output();
+    }
+
+    static constexpr const char * layer_suffixes[] = {
+        ".attn_gate.weight",
+        ".attn_k.weight",
+        ".attn_output.weight",
+        ".attn_q.weight",
+        ".attn_qkv.weight",
+        ".attn_v.weight",
+        ".ffn_down.weight",
+        ".ffn_down_shexp.weight",
+        ".ffn_gate.weight",
+        ".ffn_gate_inp.weight",
+        ".ffn_gate_shexp.weight",
+        ".ffn_up.weight",
+        ".ffn_up_shexp.weight",
+        ".ssm_alpha.weight",
+        ".ssm_beta.weight",
+        ".ssm_out.weight",
+    };
+    for (const char * suffix : layer_suffixes) {
+        if (ggml_cuda_q7_layer_name(name, suffix)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ggml_cuda_q7_q8_view_qwen_expert_weight_name(
+        const char * name) {
+    static constexpr const char * expert_suffixes[] = {
+        ".ffn_down_exps.weight",
+        ".ffn_gate_exps.weight",
+        ".ffn_gate_up_exps.weight",
+        ".ffn_up_exps.weight",
+    };
+    for (const char * suffix : expert_suffixes) {
+        if (ggml_cuda_q7_layer_name(name, suffix)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ggml_cuda_q7_normal_2d_weight_tensor(
+        const int device,
+        const ggml_tensor * tensor) {
+    if (tensor == nullptr ||
+        !ggml_cuda_q7_weight_name(tensor->name) ||
+        tensor->view_src != nullptr ||
+        tensor->op != GGML_OP_NONE ||
+        tensor->type != GGML_TYPE_Q7_0_ROCMFPX ||
+        tensor->ne[0] <= 0 ||
+        tensor->ne[1] <= 0 ||
+        tensor->ne[2] != 1 ||
+        tensor->ne[3] != 1 ||
+        tensor->ne[0] % QK_ROCMFP7 != 0 ||
+        !ggml_is_contiguous(tensor) ||
+        tensor->nb[0] != sizeof(block_rocmfp7) ||
+        tensor->nb[1] !=
+            static_cast<size_t>(tensor->ne[0] / QK_ROCMFP7) *
+                sizeof(block_rocmfp7)) {
+        return false;
+    }
+
+    return
+        ggml_cuda_info().devices[device].cc ==
+            GGML_CUDA_CC_OFFSET_AMD + 0x1151;
+}
+
+static bool ggml_cuda_q7_contiguous_3d_expert_tensor(
+        const int device,
+        const ggml_tensor * tensor) {
+    if (tensor == nullptr ||
+        !ggml_cuda_q7_weight_name(tensor->name) ||
+        !ggml_cuda_q7_q8_view_qwen_expert_weight_name(tensor->name) ||
+        tensor->view_src != nullptr ||
+        tensor->op != GGML_OP_NONE ||
+        tensor->type != GGML_TYPE_Q7_0_ROCMFPX ||
+        tensor->ne[0] <= 0 ||
+        tensor->ne[1] <= 0 ||
+        tensor->ne[2] <= 1 ||
+        tensor->ne[3] != 1 ||
+        tensor->ne[0] % QK_ROCMFP7 != 0 ||
+        !ggml_is_contiguous(tensor) ||
+        tensor->nb[0] != sizeof(block_rocmfp7) ||
+        tensor->nb[1] !=
+            static_cast<size_t>(tensor->ne[0] / QK_ROCMFP7) *
+                sizeof(block_rocmfp7) ||
+        static_cast<size_t>(tensor->ne[1]) >
+            SIZE_MAX / tensor->nb[1] ||
+        tensor->nb[2] !=
+            tensor->nb[1] * static_cast<size_t>(tensor->ne[1])) {
+        return false;
+    }
+
+    return
+        ggml_cuda_info().devices[device].cc ==
+            GGML_CUDA_CC_OFFSET_AMD + 0x1151;
+}
+
+static bool ggml_cuda_q7_q8_view_flat_rows(
+        const ggml_tensor * tensor,
+        int64_t * nrows) {
+    if (tensor == nullptr ||
+        nrows == nullptr ||
+        tensor->ne[1] <= 0 ||
+        tensor->ne[2] <= 0 ||
+        tensor->ne[1] > INT64_MAX / tensor->ne[2]) {
+        return false;
+    }
+    *nrows = tensor->ne[1] * tensor->ne[2];
+    return true;
+}
+
+static bool ggml_cuda_q7_panel16_exact_mlp_tensor(
+        const int device,
+        const ggml_tensor * tensor) {
+    if (!ggml_cuda_q7_normal_2d_weight_tensor(device, tensor)) {
+        return false;
+    }
+
+    const bool down =
+        tensor->ne[0] == 12288 &&
+        tensor->ne[1] == 4096 &&
+        ggml_cuda_q7_layer_name(
+            tensor->name,
+            ".ffn_down.weight");
+    const bool gate_or_up =
+        tensor->ne[0] == 4096 &&
+        tensor->ne[1] == 12288 &&
+        (ggml_cuda_q7_layer_name(
+             tensor->name,
+             ".ffn_gate.weight") ||
+         ggml_cuda_q7_layer_name(
+             tensor->name,
+             ".ffn_up.weight"));
+    return
+        (down || gate_or_up) &&
+        ggml_cuda_q7_panel16_cache_eligible(
+            ggml_cuda_info().devices[device].cc,
+            tensor->type,
+            tensor->ne[1],
+            tensor->ne[0],
+            tensor->nb[1] / sizeof(block_rocmfp7));
+}
+
+static bool ggml_cuda_q7_q8_view_safe_weight_tensor(
+        const int device,
+        const ggml_tensor * tensor) {
+    int64_t nrows = 0;
+    const bool ordinary_projection =
+        ggml_cuda_q7_normal_2d_weight_tensor(device, tensor) &&
+        ggml_cuda_q7_q8_view_qwen_mmq_weight_name(tensor->name);
+    const bool routed_experts =
+        ggml_cuda_q7_contiguous_3d_expert_tensor(device, tensor);
+    return
+        (ordinary_projection || routed_experts) &&
+        ggml_cuda_q7_q8_view_flat_rows(tensor, &nrows) &&
+        ggml_cuda_q7_q8_view_eligible(
+            ggml_cuda_info().devices[device].cc,
+            tensor->type,
+            nrows,
+            tensor->ne[0],
+            tensor->nb[1] / sizeof(block_rocmfp7));
+}
+
+static bool ggml_cuda_q7_panel16_tail_layout(
+        const int device,
+        const ggml_tensor * tensor,
+        size_t * canonical_size,
+        size_t * panel_offset,
+        size_t * panel_size,
+        size_t * total_size) {
+    if (!ggml_cuda_q7_panel16_exact_mlp_tensor(device, tensor)) {
+        return false;
+    }
+
+    constexpr size_t alignment = 128;
+    const size_t canonical = ggml_cuda_canonical_alloc_size(tensor);
+    if (canonical > SIZE_MAX - (alignment - 1)) {
+        return false;
+    }
+    const size_t offset =
+        (canonical + alignment - 1) & ~(alignment - 1);
+    const size_t panel =
+        ggml_cuda_q7_panel16_nbytes(tensor->ne[1], tensor->ne[0]);
+    if (panel == 0 || offset > SIZE_MAX - panel) {
+        return false;
+    }
+
+    *canonical_size = canonical;
+    *panel_offset = offset;
+    *panel_size = panel;
+    *total_size = offset + panel;
+    return true;
+}
+
+static bool ggml_cuda_q7_q8_view_tail_layout(
+        const int device,
+        const ggml_tensor * tensor,
+        size_t * canonical_size,
+        size_t * view_offset,
+        size_t * view_size,
+        size_t * total_size) {
+    if (!ggml_cuda_q7_q8_view_safe_weight_tensor(device, tensor)) {
+        return false;
+    }
+
+    constexpr size_t alignment = 128;
+    const size_t canonical = ggml_cuda_canonical_alloc_size(tensor);
+    if (canonical > SIZE_MAX - (alignment - 1)) {
+        return false;
+    }
+    const size_t offset =
+        (canonical + alignment - 1) & ~(alignment - 1);
+    int64_t nrows = 0;
+    size_t view = 0;
+    if (!ggml_cuda_q7_q8_view_flat_rows(tensor, &nrows) ||
+        !ggml_cuda_q7_q8_view_nbytes_checked(
+            nrows,
+            tensor->ne[0],
+            &view) ||
+        view == 0 ||
+        offset > SIZE_MAX - view) {
+        return false;
+    }
+
+    *canonical_size = canonical;
+    *view_offset = offset;
+    *view_size = view;
+    *total_size = offset + view;
+    return true;
+}
+
+struct ggml_cuda_q7_panel16_cache_entry {
+    static constexpr uint32_t expected_magic = 0x51375031;
+    static constexpr uint32_t expected_layout_version = 1;
+
+    uint32_t magic = expected_magic;
+    uint32_t layout_version = expected_layout_version;
+    const void * canonical = nullptr;
+    block_rocmfp7_panel16 * panel = nullptr;
+    size_t canonical_size = 0;
+    size_t panel_size = 0;
+    int64_t ncols = 0;
+    int64_t nrows = 0;
+    int64_t stride_row_blocks = 0;
+    uint64_t generation = 0;
+    bool valid = false;
+    std::mutex upload_mutex;
+};
+
+struct ggml_cuda_q7_q8_view_entry {
+    static constexpr uint32_t expected_magic = 0x51375138;
+    static constexpr uint32_t expected_layout_version = 1;
+
+    uint32_t magic = expected_magic;
+    uint32_t layout_version = expected_layout_version;
+    const void * canonical = nullptr;
+    block_q8_0 * view = nullptr;
+    size_t canonical_size = 0;
+    size_t view_size = 0;
+    int64_t ncols = 0;
+    int64_t nrows = 0;
+    int64_t stride_row_q7_blocks = 0;
+    uint64_t generation = 0;
+    bool valid = false;
+    std::mutex upload_mutex;
+};
+
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+    std::mutex q7_panel16_mutex;
+    std::map<const void *, std::unique_ptr<ggml_cuda_q7_panel16_cache_entry>>
+        q7_panel16_entries;
+    size_t q7_panel16_registered = 0;
+    size_t q7_panel16_valid = 0;
+    size_t q7_panel16_published_bytes = 0;
+    uint64_t q7_panel16_invalidated = 0;
+    bool q7_panel16_qwen_milestone_logged = false;
+    std::mutex q7_q8_view_mutex;
+    std::map<const void *, std::unique_ptr<ggml_cuda_q7_q8_view_entry>>
+        q7_q8_view_entries;
+    size_t q7_q8_view_registered = 0;
+    size_t q7_q8_view_valid = 0;
+    size_t q7_q8_view_published_bytes = 0;
+    uint64_t q7_q8_view_invalidated = 0;
+    bool q7_q8_view_qwen_milestone_logged = false;
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -672,6 +1015,484 @@ struct ggml_backend_cuda_buffer_context {
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
+
+static ggml_cuda_q7_panel16_cache_entry *
+ggml_cuda_q7_panel16_find_locked(
+        ggml_backend_cuda_buffer_context * ctx,
+        const void * canonical) {
+    const auto it = ctx->q7_panel16_entries.find(canonical);
+    return it == ctx->q7_panel16_entries.end() ? nullptr : it->second.get();
+}
+
+static void ggml_cuda_q7_panel16_mark_invalid_locked(
+        ggml_backend_cuda_buffer_context * ctx,
+        ggml_cuda_q7_panel16_cache_entry & entry) {
+    if (entry.valid) {
+        GGML_ASSERT(ctx->q7_panel16_valid > 0);
+        GGML_ASSERT(
+            ctx->q7_panel16_published_bytes >= entry.panel_size);
+        --ctx->q7_panel16_valid;
+        ctx->q7_panel16_published_bytes -= entry.panel_size;
+        ++ctx->q7_panel16_invalidated;
+        entry.valid = false;
+    }
+    ++entry.generation;
+}
+
+static void ggml_cuda_q7_panel16_invalidate_range(
+        ggml_backend_cuda_buffer_context * ctx,
+        const void * address,
+        const size_t size) {
+    if (!ggml_cuda_q7_panel16_cache_enabled() ||
+        address == nullptr ||
+        size == 0) {
+        return;
+    }
+
+    const uintptr_t write_begin = reinterpret_cast<uintptr_t>(address);
+    const uintptr_t write_end =
+        size > UINTPTR_MAX - write_begin ? UINTPTR_MAX : write_begin + size;
+
+    std::lock_guard<std::mutex> lock(ctx->q7_panel16_mutex);
+    for (auto & item : ctx->q7_panel16_entries) {
+        ggml_cuda_q7_panel16_cache_entry & entry = *item.second;
+        const uintptr_t entry_begin =
+            reinterpret_cast<uintptr_t>(entry.canonical);
+        const uintptr_t entry_end =
+            entry.canonical_size > UINTPTR_MAX - entry_begin ?
+                UINTPTR_MAX :
+                entry_begin + entry.canonical_size;
+        if (write_begin < entry_end && entry_begin < write_end) {
+            ggml_cuda_q7_panel16_mark_invalid_locked(ctx, entry);
+        }
+    }
+}
+
+static void ggml_cuda_q7_panel16_invalidate_all(
+        ggml_backend_cuda_buffer_context * ctx) {
+    if (!ggml_cuda_q7_panel16_cache_enabled()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx->q7_panel16_mutex);
+    for (auto & item : ctx->q7_panel16_entries) {
+        ggml_cuda_q7_panel16_mark_invalid_locked(ctx, *item.second);
+    }
+}
+
+static void ggml_cuda_q7_panel16_invalidate_2d(
+        ggml_backend_cuda_buffer_context * ctx,
+        const void * base,
+        const size_t offset,
+        const size_t size,
+        const size_t n_copies,
+        const size_t stride) {
+    if (!ggml_cuda_q7_panel16_cache_enabled() ||
+        n_copies == 0 ||
+        size == 0) {
+        return;
+    }
+    if (stride == 0) {
+        ggml_cuda_q7_panel16_invalidate_range(
+            ctx,
+            static_cast<const char *>(base) + offset,
+            size);
+        return;
+    }
+    if (n_copies - 1 > (SIZE_MAX - size) / stride) {
+        ggml_cuda_q7_panel16_invalidate_all(ctx);
+        return;
+    }
+
+    ggml_cuda_q7_panel16_invalidate_range(
+        ctx,
+        static_cast<const char *>(base) + offset,
+        (n_copies - 1) * stride + size);
+}
+
+static ggml_cuda_q7_q8_view_entry *
+ggml_cuda_q7_q8_view_find_locked(
+        ggml_backend_cuda_buffer_context * ctx,
+        const void * canonical) {
+    const auto it = ctx->q7_q8_view_entries.find(canonical);
+    return it == ctx->q7_q8_view_entries.end() ?
+        nullptr :
+        it->second.get();
+}
+
+static void ggml_cuda_q7_q8_view_mark_invalid_locked(
+        ggml_backend_cuda_buffer_context * ctx,
+        ggml_cuda_q7_q8_view_entry & entry) {
+    if (entry.valid) {
+        GGML_ASSERT(ctx->q7_q8_view_valid > 0);
+        GGML_ASSERT(
+            ctx->q7_q8_view_published_bytes >= entry.view_size);
+        --ctx->q7_q8_view_valid;
+        ctx->q7_q8_view_published_bytes -= entry.view_size;
+        ++ctx->q7_q8_view_invalidated;
+        entry.valid = false;
+    }
+    ++entry.generation;
+}
+
+static void ggml_cuda_q7_q8_view_invalidate_range(
+        ggml_backend_cuda_buffer_context * ctx,
+        const void * address,
+        const size_t size) {
+    if (!ggml_cuda_q7_q8_view_enabled() ||
+        address == nullptr ||
+        size == 0) {
+        return;
+    }
+
+    const uintptr_t write_begin = reinterpret_cast<uintptr_t>(address);
+    const uintptr_t write_end =
+        size > UINTPTR_MAX - write_begin ? UINTPTR_MAX : write_begin + size;
+
+    std::lock_guard<std::mutex> lock(ctx->q7_q8_view_mutex);
+    for (auto & item : ctx->q7_q8_view_entries) {
+        ggml_cuda_q7_q8_view_entry & entry = *item.second;
+        const uintptr_t entry_begin =
+            reinterpret_cast<uintptr_t>(entry.canonical);
+        const uintptr_t entry_end =
+            entry.canonical_size > UINTPTR_MAX - entry_begin ?
+                UINTPTR_MAX :
+                entry_begin + entry.canonical_size;
+        if (write_begin < entry_end && entry_begin < write_end) {
+            ggml_cuda_q7_q8_view_mark_invalid_locked(ctx, entry);
+        }
+    }
+}
+
+static void ggml_cuda_q7_q8_view_invalidate_all(
+        ggml_backend_cuda_buffer_context * ctx) {
+    if (!ggml_cuda_q7_q8_view_enabled()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx->q7_q8_view_mutex);
+    for (auto & item : ctx->q7_q8_view_entries) {
+        ggml_cuda_q7_q8_view_mark_invalid_locked(ctx, *item.second);
+    }
+}
+
+static void ggml_cuda_q7_q8_view_invalidate_2d(
+        ggml_backend_cuda_buffer_context * ctx,
+        const void * base,
+        const size_t offset,
+        const size_t size,
+        const size_t n_copies,
+        const size_t stride) {
+    if (!ggml_cuda_q7_q8_view_enabled() ||
+        n_copies == 0 ||
+        size == 0) {
+        return;
+    }
+    if (stride == 0) {
+        ggml_cuda_q7_q8_view_invalidate_range(
+            ctx,
+            static_cast<const char *>(base) + offset,
+            size);
+        return;
+    }
+    if (n_copies - 1 > (SIZE_MAX - size) / stride) {
+        ggml_cuda_q7_q8_view_invalidate_all(ctx);
+        return;
+    }
+
+    ggml_cuda_q7_q8_view_invalidate_range(
+        ctx,
+        static_cast<const char *>(base) + offset,
+        (n_copies - 1) * stride + size);
+}
+
+static uint32_t ggml_cuda_q7_panel16_read_28(
+        const uint8_t * source,
+        const int bit_offset) {
+    const int byte_offset = bit_offset >> 3;
+    const int shift = bit_offset & 7;
+    const uint32_t word =
+        static_cast<uint32_t>(source[byte_offset + 0]) |
+        (static_cast<uint32_t>(source[byte_offset + 1]) << 8) |
+        (static_cast<uint32_t>(source[byte_offset + 2]) << 16) |
+        (static_cast<uint32_t>(source[byte_offset + 3]) << 24);
+    return (word >> shift) & 0x0fffffffu;
+}
+
+static void ggml_cuda_q7_panel16_write_28(
+        uint8_t * destination,
+        const int bit_offset,
+        const uint32_t value) {
+    const int byte_offset = bit_offset >> 3;
+    const int shift = bit_offset & 7;
+    uint32_t word =
+        static_cast<uint32_t>(destination[byte_offset + 0]) |
+        (static_cast<uint32_t>(destination[byte_offset + 1]) << 8) |
+        (static_cast<uint32_t>(destination[byte_offset + 2]) << 16) |
+        (static_cast<uint32_t>(destination[byte_offset + 3]) << 24);
+    const uint32_t mask = 0x0fffffffu << shift;
+    word = (word & ~mask) | ((value & 0x0fffffffu) << shift);
+    destination[byte_offset + 0] = static_cast<uint8_t>(word);
+    destination[byte_offset + 1] = static_cast<uint8_t>(word >> 8);
+    destination[byte_offset + 2] = static_cast<uint8_t>(word >> 16);
+    destination[byte_offset + 3] = static_cast<uint8_t>(word >> 24);
+}
+
+static void * ggml_cuda_q7_panel16_repack_host(
+        const void * canonical_data,
+        const int64_t nrows,
+        const int64_t ncols,
+        const size_t panel_size) {
+    void * storage = std::aligned_alloc(
+        alignof(block_rocmfp7_panel16),
+        panel_size);
+    if (storage == nullptr) {
+        return nullptr;
+    }
+    std::memset(storage, 0, panel_size);
+
+    const block_rocmfp7 * canonical =
+        static_cast<const block_rocmfp7 *>(canonical_data);
+    block_rocmfp7_panel16 * panels =
+        static_cast<block_rocmfp7_panel16 *>(storage);
+    const int64_t macros_per_row = ncols / QK_ROCMFP7;
+    const int64_t row_panels =
+        nrows / GGML_CUDA_Q7_PANEL16_ROWS;
+
+    for (int64_t row_panel = 0; row_panel < row_panels; ++row_panel) {
+        for (int64_t macro = 0; macro < macros_per_row; ++macro) {
+            block_rocmfp7_panel16 & panel =
+                panels[row_panel * macros_per_row + macro];
+            for (int group = 0; group < NG_ROCMFP7; ++group) {
+                for (int row = 0; row < GGML_CUDA_Q7_PANEL16_ROWS; ++row) {
+                    const block_rocmfp7 & source =
+                        canonical[
+                            (row_panel * GGML_CUDA_Q7_PANEL16_ROWS + row) *
+                                macros_per_row +
+                            macro];
+                    std::memcpy(
+                        &panel.d[group][row],
+                        &source.d[group],
+                        sizeof(panel.d[group][row]));
+                    for (int quartet = 0;
+                         quartet < GGML_CUDA_Q7_PANEL16_QUARTETS;
+                         ++quartet) {
+                        const uint32_t packed =
+                            ggml_cuda_q7_panel16_read_28(
+                                source.qs +
+                                    group * QS_ROCMFP7_GROUP,
+                                quartet *
+                                    GGML_CUDA_Q7_PANEL16_QUARTET_BITS);
+                        ggml_cuda_q7_panel16_write_28(
+                            panel.q[group][
+                                ggml_cuda_q7_panel16_quartet_slot(quartet)],
+                            row *
+                                GGML_CUDA_Q7_PANEL16_QUARTET_BITS,
+                            packed);
+                    }
+                }
+            }
+        }
+    }
+
+    return storage;
+}
+
+static void * ggml_cuda_q7_q8_view_repack_host(
+        const void * canonical_data,
+        const int64_t nrows,
+        const int64_t ncols,
+        const size_t view_size) {
+    static_assert(
+        ROCMFPX_Q7_Q8_VIEW_BLOCK_BYTES == sizeof(block_q8_0),
+        "Q7 Q8-view group must be an ordinary block_q8_0");
+    static_assert(
+        ROCMFPX_Q7_Q8_VIEW_MACRO_BYTES ==
+            NG_ROCMFP7 * sizeof(block_q8_0),
+        "Q7 macro must expand to eight Q8_0 blocks");
+    static_assert(
+        sizeof(((block_rocmfp7 *) nullptr)->d[0]) ==
+            sizeof(((block_q8_0 *) nullptr)->d),
+        "Q7 and Q8_0 scales must have identical raw width");
+
+    constexpr size_t alignment = 128;
+    if (view_size == 0 || view_size > SIZE_MAX - (alignment - 1)) {
+        return nullptr;
+    }
+    const size_t allocation_size =
+        (view_size + alignment - 1) & ~(alignment - 1);
+    void * storage =
+        std::aligned_alloc(alignment, allocation_size);
+    if (storage == nullptr) {
+        return nullptr;
+    }
+
+    const block_rocmfp7 * canonical =
+        static_cast<const block_rocmfp7 *>(canonical_data);
+    const int64_t macros_per_row = ncols / QK_ROCMFP7;
+    if (!rocmfpx_q7_expand_rows_to_q8_view(
+            canonical,
+            storage,
+            nrows,
+            macros_per_row)) {
+        std::free(storage);
+        return nullptr;
+    }
+
+    return storage;
+}
+
+static ggml_cuda_q7_panel16_cache_entry *
+ggml_cuda_q7_panel16_full_upload_entry(
+        ggml_backend_buffer_t buffer,
+        ggml_tensor * tensor,
+        const size_t offset,
+        const size_t size,
+        uint64_t * generation) {
+    if (!ggml_cuda_q7_panel16_cache_enabled() ||
+        ggml_backend_buffer_get_usage(buffer) !=
+            GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+        tensor->view_src != nullptr ||
+        offset != 0 ||
+        size != ggml_nbytes(tensor)) {
+        return nullptr;
+    }
+
+    ggml_backend_cuda_buffer_context * ctx =
+        static_cast<ggml_backend_cuda_buffer_context *>(buffer->context);
+    std::lock_guard<std::mutex> lock(ctx->q7_panel16_mutex);
+    ggml_cuda_q7_panel16_cache_entry * entry =
+        ggml_cuda_q7_panel16_find_locked(ctx, tensor->data);
+    if (entry == nullptr ||
+        entry->magic !=
+            ggml_cuda_q7_panel16_cache_entry::expected_magic ||
+        entry->layout_version !=
+            ggml_cuda_q7_panel16_cache_entry::expected_layout_version ||
+        entry->ncols != tensor->ne[0] ||
+        entry->nrows != tensor->ne[1] ||
+        entry->stride_row_blocks !=
+            static_cast<int64_t>(
+                tensor->nb[1] / sizeof(block_rocmfp7))) {
+        return nullptr;
+    }
+
+    *generation = entry->generation;
+    return entry;
+}
+
+static bool ggml_cuda_q7_panel16_publish(
+        ggml_backend_cuda_buffer_context * ctx,
+        ggml_cuda_q7_panel16_cache_entry * entry,
+        const uint64_t generation) {
+    constexpr size_t qwen_q7_panel16_entries = 96;
+    constexpr size_t qwen_q7_panel16_bytes = 4529848320ULL;
+
+    std::lock_guard<std::mutex> lock(ctx->q7_panel16_mutex);
+    if (entry->generation == generation) {
+        if (!entry->valid) {
+            entry->valid = true;
+            ++ctx->q7_panel16_valid;
+            ctx->q7_panel16_published_bytes += entry->panel_size;
+        }
+        if (!ctx->q7_panel16_qwen_milestone_logged &&
+            ctx->q7_panel16_registered == qwen_q7_panel16_entries &&
+            ctx->q7_panel16_valid == qwen_q7_panel16_entries &&
+            ctx->q7_panel16_published_bytes == qwen_q7_panel16_bytes) {
+            ctx->q7_panel16_qwen_milestone_logged = true;
+            GGML_LOG_INFO(
+                "gfx1151 Q7 panel16 cache ready: "
+                "registered=%zu valid=%zu panel_bytes=%zu "
+                "invalidated=%" PRIu64 "\n",
+                ctx->q7_panel16_registered,
+                ctx->q7_panel16_valid,
+                ctx->q7_panel16_published_bytes,
+                ctx->q7_panel16_invalidated);
+        }
+        return true;
+    }
+    return false;
+}
+
+static ggml_cuda_q7_q8_view_entry *
+ggml_cuda_q7_q8_view_full_upload_entry(
+        ggml_backend_buffer_t buffer,
+        ggml_tensor * tensor,
+        const size_t offset,
+        const size_t size,
+        uint64_t * generation) {
+    if (!ggml_cuda_q7_q8_view_enabled() ||
+        ggml_backend_buffer_get_usage(buffer) !=
+            GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+        tensor->view_src != nullptr ||
+        offset != 0 ||
+        size != ggml_nbytes(tensor)) {
+        return nullptr;
+    }
+
+    ggml_backend_cuda_buffer_context * ctx =
+        static_cast<ggml_backend_cuda_buffer_context *>(buffer->context);
+    std::lock_guard<std::mutex> lock(ctx->q7_q8_view_mutex);
+    ggml_cuda_q7_q8_view_entry * entry =
+        ggml_cuda_q7_q8_view_find_locked(ctx, tensor->data);
+    int64_t nrows = 0;
+    if (entry == nullptr ||
+        !ggml_cuda_q7_q8_view_flat_rows(tensor, &nrows) ||
+        entry->magic !=
+            ggml_cuda_q7_q8_view_entry::expected_magic ||
+        entry->layout_version !=
+            ggml_cuda_q7_q8_view_entry::expected_layout_version ||
+        entry->ncols != tensor->ne[0] ||
+        entry->nrows != nrows ||
+        entry->stride_row_q7_blocks !=
+            static_cast<int64_t>(
+                tensor->nb[1] / sizeof(block_rocmfp7))) {
+        return nullptr;
+    }
+
+    *generation = entry->generation;
+    return entry;
+}
+
+static bool ggml_cuda_q7_q8_view_publish(
+        ggml_backend_cuda_buffer_context * ctx,
+        ggml_cuda_q7_q8_view_entry * entry,
+        const uint64_t generation) {
+    // Immutable Qwen3.5-9B Q7 artifact. The full scope holds all 250 Q7
+    // tensors except the GET_ROWS-only token embedding. The no-output scope
+    // also omits output.weight, which is only useful for all-token logits.
+    const bool includes_output =
+        ggml_cuda_q7_q8_view_includes_output();
+    const size_t qwen_q7_q8_view_entries =
+        includes_output ? 249 : 248;
+    const size_t qwen_q7_q8_view_bytes =
+        includes_output ? 8431599616ULL : 7350910976ULL;
+
+    std::lock_guard<std::mutex> lock(ctx->q7_q8_view_mutex);
+    if (entry->generation == generation) {
+        if (!entry->valid) {
+            entry->valid = true;
+            ++ctx->q7_q8_view_valid;
+            ctx->q7_q8_view_published_bytes += entry->view_size;
+        }
+        if (!ctx->q7_q8_view_qwen_milestone_logged &&
+            ctx->q7_q8_view_registered == qwen_q7_q8_view_entries &&
+            ctx->q7_q8_view_valid == qwen_q7_q8_view_entries &&
+            ctx->q7_q8_view_published_bytes == qwen_q7_q8_view_bytes) {
+            ctx->q7_q8_view_qwen_milestone_logged = true;
+            GGML_LOG_INFO(
+                "gfx1151 Q7 standard-Q8 compute view ready: "
+                "registered=%zu valid=%zu view_bytes=%zu "
+                "invalidated=%" PRIu64 "%s\n",
+                ctx->q7_q8_view_registered,
+                ctx->q7_q8_view_valid,
+                ctx->q7_q8_view_published_bytes,
+                ctx->q7_q8_view_invalidated,
+                includes_output ? "" : " scope=no-output");
+        }
+        return true;
+    }
+    return false;
+}
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
@@ -689,6 +1510,120 @@ static bool ggml_backend_buffer_is_cuda(ggml_backend_buffer_t buffer) {
     return buffer->iface.free_buffer == ggml_backend_cuda_buffer_free_buffer;
 }
 
+const block_rocmfp7_panel16 * ggml_cuda_q7_panel16_cache_get(
+        const ggml_tensor * tensor) {
+    if (!ggml_cuda_q7_panel16_cache_enabled() ||
+        tensor == nullptr ||
+        tensor->view_src != nullptr ||
+        tensor->buffer == nullptr ||
+        !ggml_backend_buffer_is_cuda(tensor->buffer) ||
+        ggml_backend_buffer_get_usage(tensor->buffer) !=
+            GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return nullptr;
+    }
+
+    ggml_backend_cuda_buffer_context * ctx =
+        static_cast<ggml_backend_cuda_buffer_context *>(
+            tensor->buffer->context);
+    size_t canonical_size;
+    size_t panel_offset;
+    size_t panel_size;
+    size_t total_size;
+    if (!ggml_cuda_q7_panel16_tail_layout(
+            ctx->device,
+            tensor,
+            &canonical_size,
+            &panel_offset,
+            &panel_size,
+            &total_size)) {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx->q7_panel16_mutex);
+    const ggml_cuda_q7_panel16_cache_entry * entry =
+        ggml_cuda_q7_panel16_find_locked(ctx, tensor->data);
+    if (entry == nullptr ||
+        !entry->valid ||
+        entry->magic !=
+            ggml_cuda_q7_panel16_cache_entry::expected_magic ||
+        entry->layout_version !=
+            ggml_cuda_q7_panel16_cache_entry::expected_layout_version ||
+        entry->canonical != tensor->data ||
+        entry->canonical_size != canonical_size ||
+        entry->panel_size != panel_size ||
+        entry->ncols != tensor->ne[0] ||
+        entry->nrows != tensor->ne[1] ||
+        entry->stride_row_blocks !=
+            static_cast<int64_t>(
+                tensor->nb[1] / sizeof(block_rocmfp7)) ||
+        entry->panel !=
+            reinterpret_cast<const block_rocmfp7_panel16 *>(
+                static_cast<const char *>(tensor->data) +
+                panel_offset)) {
+        return nullptr;
+    }
+
+    return entry->panel;
+}
+
+const block_q8_0 * ggml_cuda_q7_q8_view_get(
+        const ggml_tensor * tensor) {
+    if (!ggml_cuda_q7_q8_view_enabled() ||
+        tensor == nullptr ||
+        tensor->view_src != nullptr ||
+        tensor->buffer == nullptr ||
+        !ggml_backend_buffer_is_cuda(tensor->buffer) ||
+        ggml_backend_buffer_get_usage(tensor->buffer) !=
+            GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return nullptr;
+    }
+
+    ggml_backend_cuda_buffer_context * ctx =
+        static_cast<ggml_backend_cuda_buffer_context *>(
+            tensor->buffer->context);
+    size_t canonical_size;
+    size_t view_offset;
+    size_t view_size;
+    size_t total_size;
+    if (!ggml_cuda_q7_q8_view_tail_layout(
+            ctx->device,
+            tensor,
+            &canonical_size,
+            &view_offset,
+            &view_size,
+            &total_size)) {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx->q7_q8_view_mutex);
+    const ggml_cuda_q7_q8_view_entry * entry =
+        ggml_cuda_q7_q8_view_find_locked(ctx, tensor->data);
+    int64_t nrows = 0;
+    if (entry == nullptr ||
+        !ggml_cuda_q7_q8_view_flat_rows(tensor, &nrows) ||
+        !entry->valid ||
+        entry->magic !=
+            ggml_cuda_q7_q8_view_entry::expected_magic ||
+        entry->layout_version !=
+            ggml_cuda_q7_q8_view_entry::expected_layout_version ||
+        entry->canonical != tensor->data ||
+        entry->canonical_size != canonical_size ||
+        entry->view_size != view_size ||
+        entry->ncols != tensor->ne[0] ||
+        entry->nrows != nrows ||
+        entry->stride_row_q7_blocks !=
+            static_cast<int64_t>(
+                tensor->nb[1] / sizeof(block_rocmfp7)) ||
+        entry->view !=
+            reinterpret_cast<const block_q8_0 *>(
+                static_cast<const char *>(tensor->data) +
+                view_offset)) {
+        return nullptr;
+    }
+
+    return entry->view;
+}
+
 static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
     return ctx->dev_ptr;
@@ -696,6 +1631,13 @@ static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer) {
 
 static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+
+    if (ggml_cuda_q7_view_mode_get() == GGML_CUDA_Q7_VIEW_CONFLICT) {
+        GGML_LOG_WARN_ONCE(
+            "GGML_ROCM_GFX1151_Q7_PANEL16_CACHE and "
+            "GGML_ROCM_GFX1151_Q7_Q8_VIEW are mutually exclusive; "
+            "both Q7 compute views are disabled.\n");
+    }
 
     if (tensor->view_src != NULL) {
         assert(tensor->view_src->buffer->buft == buffer->buft);
@@ -705,11 +1647,152 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
     if (ggml_is_quantized(tensor->type) && tensor->view_src == nullptr && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
         // initialize padding to 0 to avoid possible NaN values
         const size_t original_size = ggml_nbytes(tensor);
-        const size_t padded_size = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
+        // Experimental Q7 compute views are distinct, initially invalid tail
+        // allocations. Do not treat either as canonical row padding.
+        const size_t padded_size = ggml_cuda_canonical_alloc_size(tensor);
 
         if (padded_size > original_size) {
             ggml_cuda_set_device(ctx->device);
             CUDA_CHECK(cudaMemset((char *)tensor->data + original_size, 0, padded_size - original_size));
+        }
+    }
+
+    size_t canonical_size;
+    size_t panel_offset;
+    size_t panel_size;
+    size_t total_size;
+    if (ggml_cuda_q7_panel16_tail_layout(
+            ctx->device,
+            tensor,
+            &canonical_size,
+            &panel_offset,
+            &panel_size,
+            &total_size)) {
+        const uintptr_t buffer_begin =
+            reinterpret_cast<uintptr_t>(ctx->dev_ptr);
+        const uintptr_t buffer_end =
+            buffer->size > UINTPTR_MAX - buffer_begin ?
+                UINTPTR_MAX :
+                buffer_begin + buffer->size;
+        const uintptr_t tensor_begin =
+            reinterpret_cast<uintptr_t>(tensor->data);
+        if (total_size <= UINTPTR_MAX - tensor_begin &&
+            tensor_begin >= buffer_begin &&
+            tensor_begin + total_size <= buffer_end) {
+            std::unique_ptr<ggml_cuda_q7_panel16_cache_entry> entry(
+                new (std::nothrow)
+                    ggml_cuda_q7_panel16_cache_entry());
+            if (entry) {
+                entry->canonical = tensor->data;
+                entry->panel =
+                    reinterpret_cast<block_rocmfp7_panel16 *>(
+                        static_cast<char *>(tensor->data) +
+                        panel_offset);
+                entry->canonical_size = canonical_size;
+                entry->panel_size = panel_size;
+                entry->ncols = tensor->ne[0];
+                entry->nrows = tensor->ne[1];
+                entry->stride_row_blocks =
+                    tensor->nb[1] / sizeof(block_rocmfp7);
+                try {
+                    std::lock_guard<std::mutex> lock(
+                        ctx->q7_panel16_mutex);
+                    const auto existing =
+                        ctx->q7_panel16_entries.find(tensor->data);
+                    if (existing ==
+                        ctx->q7_panel16_entries.end()) {
+                        ctx->q7_panel16_entries.emplace(
+                            tensor->data,
+                            std::move(entry));
+                        ++ctx->q7_panel16_registered;
+                    } else {
+                        ggml_cuda_q7_panel16_mark_invalid_locked(
+                            ctx,
+                            *existing->second);
+                        existing->second = std::move(entry);
+                    }
+                } catch (const std::bad_alloc &) {
+                    GGML_LOG_WARN_ONCE(
+                        "Q7 panel16 cache metadata allocation failed; "
+                        "using canonical weights.\n");
+                }
+            } else {
+                GGML_LOG_WARN_ONCE(
+                    "Q7 panel16 cache metadata allocation failed; "
+                    "using canonical weights.\n");
+            }
+        }
+    }
+
+    size_t q8_canonical_size;
+    size_t q8_view_offset;
+    size_t q8_view_size;
+    size_t q8_total_size;
+    if (ggml_cuda_q7_q8_view_tail_layout(
+            ctx->device,
+            tensor,
+            &q8_canonical_size,
+            &q8_view_offset,
+            &q8_view_size,
+            &q8_total_size)) {
+        const uintptr_t buffer_begin =
+            reinterpret_cast<uintptr_t>(ctx->dev_ptr);
+        const uintptr_t buffer_end =
+            buffer->size > UINTPTR_MAX - buffer_begin ?
+                UINTPTR_MAX :
+                buffer_begin + buffer->size;
+        const uintptr_t tensor_begin =
+            reinterpret_cast<uintptr_t>(tensor->data);
+        if (q8_total_size <= UINTPTR_MAX - tensor_begin &&
+            tensor_begin >= buffer_begin &&
+            tensor_begin + q8_total_size <= buffer_end) {
+            std::unique_ptr<ggml_cuda_q7_q8_view_entry> entry(
+                new (std::nothrow)
+                    ggml_cuda_q7_q8_view_entry());
+            if (entry) {
+                int64_t nrows = 0;
+                GGML_ASSERT(
+                    ggml_cuda_q7_q8_view_flat_rows(
+                        tensor,
+                        &nrows));
+                entry->canonical = tensor->data;
+                entry->view =
+                    reinterpret_cast<block_q8_0 *>(
+                        static_cast<char *>(tensor->data) +
+                        q8_view_offset);
+                entry->canonical_size = q8_canonical_size;
+                entry->view_size = q8_view_size;
+                entry->ncols = tensor->ne[0];
+                entry->nrows = nrows;
+                entry->stride_row_q7_blocks =
+                    tensor->nb[1] / sizeof(block_rocmfp7);
+                try {
+                    std::lock_guard<std::mutex> lock(
+                        ctx->q7_q8_view_mutex);
+                    const auto existing =
+                        ctx->q7_q8_view_entries.find(tensor->data);
+                    if (existing ==
+                        ctx->q7_q8_view_entries.end()) {
+                        ctx->q7_q8_view_entries.emplace(
+                            tensor->data,
+                            std::move(entry));
+                        ++ctx->q7_q8_view_registered;
+                    } else {
+                        ggml_cuda_q7_q8_view_mark_invalid_locked(
+                            ctx,
+                            *existing->second);
+                        existing->second = std::move(entry);
+                    }
+                } catch (const std::bad_alloc &) {
+                    GGML_LOG_WARN_ONCE(
+                        "Q7 standard-Q8 compute-view metadata "
+                        "allocation failed; using canonical weights.\n");
+                }
+            } else {
+                GGML_LOG_WARN_ONCE(
+                    "Q7 standard-Q8 compute-view metadata allocation "
+                    "failed; using canonical weights.\n");
+            }
         }
     }
     return GGML_STATUS_SUCCESS;
@@ -718,6 +1801,14 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
+    ggml_cuda_q7_panel16_invalidate_range(
+        ctx,
+        static_cast<char *>(tensor->data) + offset,
+        size);
+    ggml_cuda_q7_q8_view_invalidate_range(
+        ctx,
+        static_cast<char *>(tensor->data) + offset,
+        size);
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -726,9 +1817,128 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
+    ggml_cuda_q7_panel16_invalidate_range(
+        ctx,
+        static_cast<char *>(tensor->data) + offset,
+        size);
+    ggml_cuda_q7_q8_view_invalidate_range(
+        ctx,
+        static_cast<char *>(tensor->data) + offset,
+        size);
+
+    uint64_t panel_generation = 0;
+    ggml_cuda_q7_panel16_cache_entry * panel_entry =
+        ggml_cuda_q7_panel16_full_upload_entry(
+            buffer,
+            tensor,
+            offset,
+            size,
+            &panel_generation);
+    uint64_t q8_generation = 0;
+    ggml_cuda_q7_q8_view_entry * q8_entry =
+        ggml_cuda_q7_q8_view_full_upload_entry(
+            buffer,
+            tensor,
+            offset,
+            size,
+            &q8_generation);
+    GGML_ASSERT(panel_entry == nullptr || q8_entry == nullptr);
+
+    std::unique_lock<std::mutex> panel_upload_lock;
+    if (panel_entry != nullptr) {
+        panel_upload_lock =
+            std::unique_lock<std::mutex>(panel_entry->upload_mutex);
+    }
+    std::unique_lock<std::mutex> q8_upload_lock;
+    if (q8_entry != nullptr) {
+        q8_upload_lock =
+            std::unique_lock<std::mutex>(q8_entry->upload_mutex);
+    }
+
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+
+    void * panel_host = nullptr;
+    if (panel_entry != nullptr) {
+        panel_host = ggml_cuda_q7_panel16_repack_host(
+            data,
+            panel_entry->nrows,
+            panel_entry->ncols,
+            panel_entry->panel_size);
+        if (panel_host != nullptr) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                panel_entry->panel,
+                panel_host,
+                panel_entry->panel_size,
+                cudaMemcpyHostToDevice,
+                cudaStreamPerThread));
+        } else {
+            GGML_LOG_WARN_ONCE(
+                "Q7 panel16 host repack allocation failed; "
+                "using canonical weights.\n");
+        }
+    }
+
+    void * q8_host = nullptr;
+    if (q8_entry != nullptr) {
+        q8_host = ggml_cuda_q7_q8_view_repack_host(
+            data,
+            q8_entry->nrows,
+            q8_entry->ncols,
+            q8_entry->view_size);
+        if (q8_host != nullptr) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                q8_entry->view,
+                q8_host,
+                q8_entry->view_size,
+                cudaMemcpyHostToDevice,
+                cudaStreamPerThread));
+        } else {
+            GGML_LOG_WARN_ONCE(
+                "Q7 standard-Q8 compute-view host repack allocation "
+                "failed; using canonical weights.\n");
+        }
+    }
+
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    const bool panel_ready = panel_host != nullptr;
+    std::free(panel_host);
+    if (panel_entry != nullptr && panel_ready) {
+        if (ggml_cuda_q7_panel16_publish(
+                ctx,
+                panel_entry,
+                panel_generation)) {
+            static std::once_flag log_first_publish;
+            std::call_once(
+                log_first_publish,
+                [tensor, panel_entry]() {
+                    GGML_LOG_INFO(
+                        "gfx1151 Q7 panel16 cache published: "
+                        "tensor=%s panel_bytes=%zu\n",
+                        tensor->name,
+                        panel_entry->panel_size);
+                });
+        }
+    }
+    const bool q8_ready = q8_host != nullptr;
+    std::free(q8_host);
+    if (q8_entry != nullptr && q8_ready) {
+        if (ggml_cuda_q7_q8_view_publish(
+                ctx,
+                q8_entry,
+                q8_generation)) {
+            static std::once_flag log_first_q8_publish;
+            std::call_once(
+                log_first_q8_publish,
+                [tensor, q8_entry]() {
+                    GGML_LOG_INFO(
+                        "gfx1151 Q7 standard-Q8 compute view "
+                        "published: tensor=%s view_bytes=%zu\n",
+                        tensor->name,
+                        q8_entry->view_size);
+                });
+        }
+    }
 }
 
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -743,6 +1953,20 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
+    ggml_cuda_q7_panel16_invalidate_2d(
+        ctx,
+        tensor->data,
+        offset,
+        size,
+        n_copies,
+        stride_tensor);
+    ggml_cuda_q7_q8_view_invalidate_2d(
+        ctx,
+        tensor->data,
+        offset,
+        size,
+        n_copies,
+        stride_tensor);
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
@@ -763,6 +1987,14 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
+        ggml_cuda_q7_panel16_invalidate_range(
+            dst_ctx,
+            dst->data,
+            ggml_nbytes(dst));
+        ggml_cuda_q7_q8_view_invalidate_range(
+            dst_ctx,
+            dst->data,
+            ggml_nbytes(dst));
         if (src_ctx->device == dst_ctx->device) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         } else {
@@ -783,6 +2015,8 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
 static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
+    ggml_cuda_q7_panel16_invalidate_all(ctx);
+    ggml_cuda_q7_q8_view_invalidate_all(ctx);
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -850,19 +2084,43 @@ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_ty
 }
 
 static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
-    size_t size = ggml_nbytes(tensor);
-    int64_t ne0 = tensor->ne[0];
+    const size_t canonical_size =
+        ggml_cuda_canonical_alloc_size(tensor);
+    ggml_backend_cuda_buffer_type_context * ctx =
+        static_cast<ggml_backend_cuda_buffer_type_context *>(
+            buft->context);
 
-    if (ggml_is_quantized(tensor->type)) {
-        if (ne0 % MATRIX_ROW_PADDING != 0) {
-            GGML_ASSERT(tensor->nb[0] == ggml_element_size(tensor));
-            size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
-        }
+    size_t cache_canonical_size;
+    size_t panel_offset;
+    size_t panel_size;
+    size_t total_size;
+    if (ggml_cuda_q7_panel16_tail_layout(
+            ctx->device,
+            tensor,
+            &cache_canonical_size,
+            &panel_offset,
+            &panel_size,
+            &total_size)) {
+        GGML_ASSERT(cache_canonical_size == canonical_size);
+        return total_size;
     }
 
-    return size;
+    size_t q8_canonical_size;
+    size_t q8_view_offset;
+    size_t q8_view_size;
+    size_t q8_total_size;
+    if (ggml_cuda_q7_q8_view_tail_layout(
+            ctx->device,
+            tensor,
+            &q8_canonical_size,
+            &q8_view_offset,
+            &q8_view_size,
+            &q8_total_size)) {
+        GGML_ASSERT(q8_canonical_size == canonical_size);
+        return q8_total_size;
+    }
 
-    GGML_UNUSED(buft);
+    return canonical_size;
 }
 
 static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface = {
@@ -3262,6 +4520,18 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    // Phase one only builds either compute view from a complete synchronous
+    // host upload. Chunked async model loads keep both entries invalid.
+    ggml_backend_cuda_buffer_context * buf_ctx =
+        static_cast<ggml_backend_cuda_buffer_context *>(buf->context);
+    ggml_cuda_q7_panel16_invalidate_range(
+        buf_ctx,
+        static_cast<char *>(tensor->data) + offset,
+        size);
+    ggml_cuda_q7_q8_view_invalidate_range(
+        buf_ctx,
+        static_cast<char *>(tensor->data) + offset,
+        size);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -3281,6 +4551,22 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_backend_cuda_buffer_context * buf_ctx =
+        static_cast<ggml_backend_cuda_buffer_context *>(buf->context);
+    ggml_cuda_q7_panel16_invalidate_2d(
+        buf_ctx,
+        tensor->data,
+        offset,
+        size,
+        n_copies,
+        stride_tensor);
+    ggml_cuda_q7_q8_view_invalidate_2d(
+        buf_ctx,
+        tensor->data,
+        offset,
+        size,
+        n_copies,
+        stride_tensor);
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -3321,6 +4607,15 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 #endif // NDEBUG
         return false;
     }
+
+    ggml_cuda_q7_panel16_invalidate_range(
+        buf_ctx_dst,
+        dst->data,
+        ggml_nbytes(dst));
+    ggml_cuda_q7_q8_view_invalidate_range(
+        buf_ctx_dst,
+        dst->data,
+        ggml_nbytes(dst));
 
     if (backend_src != backend_dst) {
         // copy on src stream
@@ -5293,6 +6588,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q3_0_ROCMFPX:
                     case GGML_TYPE_Q6_0_ROCMFPX:
                     case GGML_TYPE_Q8_0_ROCMFPX:
+                    case GGML_TYPE_Q7_0_ROCMFPX:
                     case GGML_TYPE_NVFP4:
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
@@ -5335,6 +6631,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q3_0_ROCMFPX:
                     case GGML_TYPE_Q6_0_ROCMFPX:
                     case GGML_TYPE_Q8_0_ROCMFPX:
+                    case GGML_TYPE_Q7_0_ROCMFPX:
                         return true;
                     default:
                         return false;

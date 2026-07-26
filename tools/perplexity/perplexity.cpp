@@ -10,10 +10,12 @@
 #include <chrono>
 #include <clocale>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <iomanip>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -2084,6 +2086,39 @@ int main(int argc, char ** argv) {
         kl_divergence(ctx, params);
     } else {
         results = perplexity(ctx, params, n_ctx);
+        const char * trace_path = getenv("LLAMA_PPL_TOKEN_TRACE");
+        if (trace_path != nullptr && trace_path[0] != '\0') {
+            std::ofstream trace(trace_path);
+            if (!trace) {
+                LOG_ERR("failed to open token-loss trace: %s\n", trace_path);
+                return 1;
+            }
+            trace << "position,token,target_logit,probability,loss\n";
+            trace << std::setprecision(17);
+            size_t written = 0;
+            for (size_t i = 0; i < results.tokens.size(); ++i) {
+                const float probability = results.probs[i];
+                if (!(probability > 0.0f) || !std::isfinite(probability)) {
+                    continue;
+                }
+                trace
+                    << i << ','
+                    << results.tokens[i] << ','
+                    << results.logits[i] << ','
+                    << probability << ','
+                    << -std::log(static_cast<double>(probability))
+                    << '\n';
+                ++written;
+            }
+            if (!trace) {
+                LOG_ERR("failed to write token-loss trace: %s\n", trace_path);
+                return 1;
+            }
+            LOG_INF(
+                "wrote token-loss trace: %s rows=%zu\n",
+                trace_path,
+                written);
+        }
     }
 
     LOG("\n");

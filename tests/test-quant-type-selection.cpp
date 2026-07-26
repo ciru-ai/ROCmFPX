@@ -66,6 +66,7 @@ static const ftype_name_entry ftype_name_table[] = {
     { "Q4_0_ROCMFP4_STRIX_LEAN", LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN },
     { "Q3_0_ROCMFPX",            LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX            },
     { "Q6_0_ROCMFPX",            LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX            },
+    { "Q7_0_ROCMFPX",            LLAMA_FTYPE_MOSTLY_Q7_0_ROCMFPX            },
     { "Q8_0_ROCMFPX",            LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX            },
     { "Q3_0_ROCMFPX_AGENT",      LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX_AGENT      },
     { "Q6_0_ROCMFPX_AGENT",      LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT      },
@@ -287,6 +288,79 @@ static mock_tensors build_mock_tensors(const quantize_state_impl * qs, const ggu
     return { std::move(ctx), std::move(result) };
 }
 
+static bool run_local_q7_tests() {
+    const llama_quant_model_desc desc = {
+        /*.architecture =*/ "llama",
+        /*.n_embd       =*/ 512,
+        /*.n_ff         =*/ 1024,
+        /*.n_layer      =*/ 2,
+        /*.n_head       =*/ 8,
+        /*.n_head_kv    =*/ 8,
+        /*.n_expert     =*/ 8,
+        /*.n_embd_head_k=*/ 64,
+        /*.n_embd_head_v=*/ 64,
+    };
+
+    llama_model * model = llama_quant_model_from_metadata(&desc);
+    llama_model_quantize_params qparams = llama_model_quantize_default_params();
+    quantize_state_impl * qs = llama_quant_init(model, &qparams);
+
+    static const struct {
+        const char * name;
+        int64_t      ncols;
+        ggml_type    expected;
+    } cases[] = {
+        { "token_embd.weight",       512, GGML_TYPE_Q7_0_ROCMFPX },
+        { "output.weight",           512, GGML_TYPE_Q7_0_ROCMFPX },
+        { "blk.0.attn_v.weight",     512, GGML_TYPE_Q7_0_ROCMFPX },
+        { "blk.0.attn_k.weight",     512, GGML_TYPE_Q7_0_ROCMFPX },
+        { "blk.0.attn_q.weight",     512, GGML_TYPE_Q7_0_ROCMFPX },
+        { "blk.0.ffn_up.weight",     512, GGML_TYPE_Q7_0_ROCMFPX },
+        { "blk.0.ffn_down.weight",   512, GGML_TYPE_Q7_0_ROCMFPX },
+        { "blk.1.ffn_up.weight",     288, GGML_TYPE_Q8_0          },
+        { "blk.1.ffn_down.weight",   255, GGML_TYPE_F16           },
+    };
+
+    struct ggml_init_params ctx_params = {
+        sizeof(cases) / sizeof(cases[0]) * ggml_tensor_overhead(),
+        nullptr,
+        true,
+    };
+    ggml_context_ptr ctx(ggml_init(ctx_params));
+    std::vector<ggml_tensor *> tensors;
+    tensors.reserve(sizeof(cases) / sizeof(cases[0]));
+
+    bool all_pass = true;
+    for (const auto & test_case : cases) {
+        ggml_tensor * tensor = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, test_case.ncols, 4);
+        ggml_set_name(tensor, test_case.name);
+        if (!llama_quant_tensor_allows_quantization(qs, tensor)) {
+            printf("  FAIL  local Q7 test tensor is not quantizable: %s\n", test_case.name);
+            all_pass = false;
+        }
+        tensors.push_back(tensor);
+    }
+
+    std::vector<ggml_type> result_types(tensors.size());
+    llama_quant_compute_types(
+        qs, LLAMA_FTYPE_MOSTLY_Q7_0_ROCMFPX,
+        tensors.data(), result_types.data(), tensors.size());
+
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        if (result_types[i] != cases[i].expected) {
+            printf("  FAIL  %-32s Q7_0_ROCMFPX expected %s, got %s\n",
+                   cases[i].name, ggml_type_name(cases[i].expected), ggml_type_name(result_types[i]));
+            all_pass = false;
+        }
+    }
+
+    llama_quant_free(qs);
+    llama_model_free(model);
+
+    printf("  %s  local Q7_0_ROCMFPX pure-routing and fallback checks\n", all_pass ? "PASS" : "FAIL");
+    return all_pass;
+}
+
 // ---------------------------------------------------------------------------
 // Generate mode: regenerate all snapshot files
 // Use this when either adding new models or modifying quants
@@ -506,10 +580,13 @@ static int run_remote_tests(const std::string & snapshot_dir, const char * argv0
 int main(int argc, char ** argv) {
     std::string snapshot_dir = SNAPSHOT_DIR;
     bool        generate     = false;
+    bool        local_only   = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--generate") == 0) {
             generate = true;
+        } else if (strcmp(argv[i], "--local-only") == 0) {
+            local_only = true;
         } else if (strcmp(argv[i], "--snapshot-dir") == 0 && i + 1 < argc) {
             snapshot_dir = argv[++i];
         }
@@ -521,6 +598,13 @@ int main(int argc, char ** argv) {
 
     // suppress llama log warnings during test (e.g. tensor type fallback messages)
     llama_log_set([](enum ggml_log_level, const char *, void *) {}, nullptr);
+
+    if (!run_local_q7_tests()) {
+        return 1;
+    }
+    if (local_only) {
+        return 0;
+    }
 
     return run_remote_tests(snapshot_dir, argv[0]);
 }

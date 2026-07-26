@@ -2,6 +2,197 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "q7-panel16-cache.cuh"
+#include "q7-q8-view-cache.cuh"
+
+#include <atomic>
+#include <cinttypes>
+#include <cstring>
+
+namespace {
+
+std::atomic<uint64_t> g_q7_panel16_mmq_handoffs{0};
+std::atomic<uint64_t> g_q7_panel16_kernel_launches{0};
+std::atomic<uint64_t> g_q7_q8_view_mmq_handoffs{0};
+std::atomic<uint64_t> g_q7_q8_view_kernel_dispatches{0};
+std::atomic<uint64_t> g_q7_q8_view_output_dispatches{0};
+std::atomic<uint64_t> g_q7_q8_view_expert_handoffs{0};
+std::atomic<uint64_t> g_q7_q8_view_expert_dispatches{0};
+
+static size_t q7_q8_view_tensor_nbytes(
+        const ggml_tensor * tensor) {
+    if (tensor == nullptr ||
+        tensor->ne[1] <= 0 ||
+        tensor->ne[2] <= 0 ||
+        tensor->ne[1] > INT64_MAX / tensor->ne[2]) {
+        return 0;
+    }
+    return ggml_cuda_q7_q8_view_nbytes(
+        tensor->ne[1] * tensor->ne[2],
+        tensor->ne[0]);
+}
+
+} // namespace
+
+void ggml_cuda_q7_panel16_note_mmq_handoff(
+        const ggml_tensor * tensor) {
+    const uint64_t count =
+        g_q7_panel16_mmq_handoffs.fetch_add(
+            1,
+            std::memory_order_relaxed) +
+        1;
+    if (count == 1) {
+        GGML_LOG_INFO(
+            "gfx1151 Q7 panel16 MMQ cache handoff: "
+            "handoffs=%" PRIu64 " tensor=%s panel_bytes=%zu\n",
+            count,
+            tensor->name,
+            ggml_cuda_q7_panel16_nbytes(
+                tensor->ne[1],
+                tensor->ne[0]));
+    }
+}
+
+void ggml_cuda_q7_panel16_note_kernel_launch(
+        const int mmq_x,
+        const int64_t nrows_x,
+        const int64_t ncols_x,
+        const int64_t ncols_dst) {
+    const uint64_t count =
+        g_q7_panel16_kernel_launches.fetch_add(
+            1,
+            std::memory_order_relaxed) +
+        1;
+    if (count == 1) {
+        GGML_LOG_INFO(
+            "gfx1151 Q7 panel16 MMQ kernel launched: "
+            "launches=%" PRIu64 " mmq_x=%d "
+            "m=%" PRId64 " n=%" PRId64 " k=%" PRId64 "\n",
+            count,
+            mmq_x,
+            nrows_x,
+            ncols_dst,
+            ncols_x);
+    }
+}
+
+uint64_t ggml_cuda_q7_panel16_mmq_handoff_count() {
+    return g_q7_panel16_mmq_handoffs.load(std::memory_order_relaxed);
+}
+
+uint64_t ggml_cuda_q7_panel16_kernel_launch_count() {
+    return g_q7_panel16_kernel_launches.load(std::memory_order_relaxed);
+}
+
+void ggml_cuda_q7_q8_view_note_mmq_handoff(
+        const ggml_tensor * tensor) {
+    const uint64_t count =
+        g_q7_q8_view_mmq_handoffs.fetch_add(
+            1,
+            std::memory_order_relaxed) +
+        1;
+    if (count == 1) {
+        GGML_LOG_INFO(
+            "gfx1151 Q7 standard-Q8 compute-view MMQ handoff: "
+            "handoffs=%" PRIu64 " tensor=%s view_bytes=%zu\n",
+            count,
+            tensor->name,
+            q7_q8_view_tensor_nbytes(tensor));
+    }
+    if (std::strstr(tensor->name, "_exps.weight") != nullptr) {
+        const uint64_t expert_count =
+            g_q7_q8_view_expert_handoffs.fetch_add(
+                1,
+                std::memory_order_relaxed) +
+            1;
+        if (expert_count == 1) {
+            GGML_LOG_INFO(
+                "gfx1151 Q7 standard-Q8 routed-expert MMQ handoff: "
+                "handoffs=%" PRIu64 " tensor=%s experts=%" PRId64
+                " view_bytes=%zu\n",
+                expert_count,
+                tensor->name,
+                tensor->ne[2],
+                q7_q8_view_tensor_nbytes(tensor));
+        }
+    }
+}
+
+void ggml_cuda_q7_q8_view_note_kernel_dispatch(
+        const ggml_tensor * tensor,
+        const int64_t nrows_x,
+        const int64_t ncols_x,
+        const int64_t ncols_dst) {
+    const uint64_t count =
+        g_q7_q8_view_kernel_dispatches.fetch_add(
+            1,
+            std::memory_order_relaxed) +
+        1;
+    if (count == 1) {
+        GGML_LOG_INFO(
+            "gfx1151 Q7 standard-Q8 staged MMQ dispatched: "
+            "dispatches=%" PRIu64 " m=%" PRId64
+            " n=%" PRId64 " k=%" PRId64 "\n",
+            count,
+            nrows_x,
+            ncols_dst,
+            ncols_x);
+    }
+    if (std::strcmp(tensor->name, "output.weight") == 0) {
+        const uint64_t output_count =
+            g_q7_q8_view_output_dispatches.fetch_add(
+                1,
+                std::memory_order_relaxed) +
+            1;
+        if (output_count == 1) {
+            GGML_LOG_INFO(
+                "gfx1151 Q7 standard-Q8 output.weight MMQ dispatched: "
+                "dispatches=%" PRIu64 " m=%" PRId64
+                " n=%" PRId64 " k=%" PRId64
+                " view_bytes=%zu\n",
+                output_count,
+                nrows_x,
+                ncols_dst,
+                ncols_x,
+                q7_q8_view_tensor_nbytes(tensor));
+        }
+    }
+    if (std::strstr(tensor->name, "_exps.weight") != nullptr) {
+        const uint64_t expert_count =
+            g_q7_q8_view_expert_dispatches.fetch_add(
+                1,
+                std::memory_order_relaxed) +
+            1;
+        if (expert_count == 1) {
+            GGML_LOG_INFO(
+                "gfx1151 Q7 standard-Q8 routed-expert staged MMQ "
+                "dispatched: dispatches=%" PRIu64
+                " tensor=%s experts=%" PRId64
+                " m=%" PRId64 " n=%" PRId64 " k=%" PRId64 "\n",
+                expert_count,
+                tensor->name,
+                tensor->ne[2],
+                nrows_x,
+                ncols_dst,
+                ncols_x);
+        }
+    }
+}
+
+uint64_t ggml_cuda_q7_q8_view_mmq_handoff_count() {
+    return g_q7_q8_view_mmq_handoffs.load(
+        std::memory_order_relaxed);
+}
+
+uint64_t ggml_cuda_q7_q8_view_kernel_dispatch_count() {
+    return g_q7_q8_view_kernel_dispatches.load(
+        std::memory_order_relaxed);
+}
+
+uint64_t ggml_cuda_q7_q8_view_output_dispatch_count() {
+    return g_q7_q8_view_output_dispatches.load(
+        std::memory_order_relaxed);
+}
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
@@ -37,6 +228,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             break;
         case GGML_TYPE_Q6_0_ROCMFPX:
             mul_mat_q_case<GGML_TYPE_Q6_0_ROCMFPX>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q7_0_ROCMFPX:
+            mul_mat_q_case<GGML_TYPE_Q7_0_ROCMFPX>(ctx, args, stream);
             break;
         case GGML_TYPE_Q8_0_ROCMFPX:
             mul_mat_q_case<GGML_TYPE_Q8_0_ROCMFPX>(ctx, args, stream);
@@ -140,6 +334,23 @@ void ggml_cuda_mul_mat_q(
     const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
 
     if (!ids) {
+        const block_rocmfp7_panel16 * src0_q7_panel16 =
+            ggml_cuda_q7_panel16_cache_get(src0);
+        const block_q8_0 * src0_q7_q8_view =
+            ggml_cuda_q7_q8_view_get(src0);
+        GGML_ASSERT(
+            src0_q7_panel16 == nullptr ||
+            src0_q7_q8_view == nullptr);
+        if (src0_q7_panel16 != nullptr) {
+            ggml_cuda_q7_panel16_note_mmq_handoff(src0);
+        }
+        if (src0_q7_q8_view != nullptr) {
+            ggml_cuda_q7_q8_view_note_mmq_handoff(src0);
+        }
+        const ggml_type mmq_type_x =
+            src0_q7_q8_view != nullptr ?
+                GGML_TYPE_Q8_0 :
+                src0->type;
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
             get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
@@ -154,7 +365,7 @@ void ggml_cuda_mul_mat_q(
                                         ne11, ne12, ne13, stream);
 
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), mmq_type_x, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
@@ -171,7 +382,30 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            use_stream_k, ne1};
+            use_stream_k, ne1,
+            src0_q7_panel16, src0_q7_panel16 != nullptr};
+        if (src0_q7_q8_view != nullptr) {
+            mmq_args q8_args = args;
+            q8_args.x =
+                reinterpret_cast<const char *>(src0_q7_q8_view);
+            q8_args.type_x = GGML_TYPE_Q8_0;
+            q8_args.stride_row_x *= NG_ROCMFP7;
+            q8_args.stride_channel_x *= NG_ROCMFP7;
+            q8_args.stride_sample_x *= NG_ROCMFP7;
+            q8_args.x_q7_panel16 = nullptr;
+            q8_args.has_q7_panel16_cache = false;
+            q8_args.force_staged_q8 = true;
+            ggml_cuda_q7_q8_view_note_kernel_dispatch(
+                src0,
+                q8_args.nrows_x,
+                q8_args.ncols_x,
+                q8_args.ncols_dst);
+            ggml_cuda_mul_mat_q_switch_type(
+                ctx,
+                q8_args,
+                stream);
+            return;
+        }
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -183,6 +417,16 @@ void ggml_cuda_mul_mat_q(
     const int64_t n_expert_used = ids->ne[0];
     const int64_t ne_get_rows = ne12 * n_expert_used;
     GGML_ASSERT(ne1 == n_expert_used);
+
+    const block_q8_0 * src0_q7_q8_view =
+        ggml_cuda_q7_q8_view_get(src0);
+    if (src0_q7_q8_view != nullptr) {
+        ggml_cuda_q7_q8_view_note_mmq_handoff(src0);
+    }
+    const ggml_type mmq_type_x =
+        src0_q7_q8_view != nullptr ?
+            GGML_TYPE_Q8_0 :
+            src0->type;
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
@@ -215,7 +459,7 @@ void ggml_cuda_mul_mat_q(
             quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
                                     ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         } else {
-            quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+            quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), mmq_type_x, ne10, s11, s12, s13,
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         }
         CUDA_CHECK(cudaGetLastError());
@@ -232,7 +476,29 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        use_stream_k, ne12};
+        use_stream_k, ne12,
+        nullptr, false};
+
+    if (src0_q7_q8_view != nullptr) {
+        mmq_args q8_args = args;
+        q8_args.x =
+            reinterpret_cast<const char *>(src0_q7_q8_view);
+        q8_args.type_x = GGML_TYPE_Q8_0;
+        q8_args.stride_row_x *= NG_ROCMFP7;
+        q8_args.stride_channel_x *= NG_ROCMFP7;
+        q8_args.stride_sample_x *= NG_ROCMFP7;
+        q8_args.force_staged_q8 = true;
+        ggml_cuda_q7_q8_view_note_kernel_dispatch(
+            src0,
+            q8_args.nrows_x,
+            q8_args.ncols_x,
+            q8_args.ncols_dst);
+        ggml_cuda_mul_mat_q_switch_type(
+            ctx,
+            q8_args,
+            stream);
+        return;
+    }
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
@@ -272,7 +538,8 @@ void ggml_cuda_op_mul_mat_q(
         ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
         1, 1, 0, 0, 0,
         1, 1, 0, 0, 0,
-        use_stream_k, src1_ncols};
+        use_stream_k, src1_ncols,
+        nullptr, false};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 
@@ -298,6 +565,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_Q4_0_ROCMFP4_FAST:
         case GGML_TYPE_Q3_0_ROCMFPX:
         case GGML_TYPE_Q6_0_ROCMFPX:
+        case GGML_TYPE_Q7_0_ROCMFPX:
         case GGML_TYPE_Q8_0_ROCMFPX:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q2_K:

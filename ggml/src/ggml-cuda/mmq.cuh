@@ -3,9 +3,12 @@
 #include "common.cuh"
 #include "vecdotq.cuh"
 #include "mma.cuh"
+#include "q7-panel16-cache.cuh"
 
 #include <climits>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 using namespace ggml_cuda_mma;
 
@@ -76,6 +79,7 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
         case GGML_TYPE_Q4_0_ROCMFP4_FAST:
         case GGML_TYPE_Q3_0_ROCMFPX:
         case GGML_TYPE_Q6_0_ROCMFPX:
+        case GGML_TYPE_Q7_0_ROCMFPX:
         case GGML_TYPE_Q8_0_ROCMFPX:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_NVFP4:
@@ -224,6 +228,7 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_Q3_0_ROCMFPX:
         case GGML_TYPE_Q6_0_ROCMFPX:
                                 return MMQ_DP4A_TXS_Q8_0_16;
+        case GGML_TYPE_Q7_0_ROCMFPX:
         case GGML_TYPE_Q8_0_ROCMFPX:
                                 return MMQ_DP4A_TXS_Q8_0;
         default:                return tile_x_sizes{0, 0, 0};
@@ -283,6 +288,7 @@ static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
         case GGML_TYPE_Q3_0_ROCMFPX:
         case GGML_TYPE_Q6_0_ROCMFPX:
                                 return MMQ_MMA_TILE_X_K_Q3_K;
+        case GGML_TYPE_Q7_0_ROCMFPX:
         case GGML_TYPE_Q8_0_ROCMFPX:
                                 return MMQ_MMA_TILE_X_K_Q8_0;
         default:                return 0;
@@ -1252,6 +1258,102 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     }
 }
 
+static __device__ __forceinline__ uint32_t rocmfpx_spread_q7_to_i8_mmq(
+        const uint32_t packed28) {
+#if defined(GGML_USE_HIP)
+    int32_t q0;
+    int32_t q1;
+    int32_t q2;
+    int32_t q3;
+    asm("v_bfe_i32 %0, %1,  0, 7" : "=v"(q0) : "v"(packed28));
+    asm("v_bfe_i32 %0, %1,  7, 7" : "=v"(q1) : "v"(packed28));
+    asm("v_bfe_i32 %0, %1, 14, 7" : "=v"(q2) : "v"(packed28));
+    asm("v_bfe_i32 %0, %1, 21, 7" : "=v"(q3) : "v"(packed28));
+    const uint32_t q01 = __builtin_amdgcn_perm(q1, q0, 0x0c0c0400);
+    const uint32_t q23 = __builtin_amdgcn_perm(q3, q2, 0x0c0c0400);
+    return __builtin_amdgcn_perm(q23, q01, 0x05040100);
+#else
+    // Deposit the four contiguous 7-bit codes into byte lanes in two stages,
+    // then copy each sign bit into bit 7. This is exact for signed Q7 values
+    // and is substantially leaner on gfx1151 than four extracts and permutes.
+    uint32_t bytes = (packed28 & 0x00003fffu) |
+                     ((packed28 << 2) & 0x3fff0000u);
+    bytes = (bytes & 0x007f007fu) |
+            ((bytes << 1) & 0x7f007f00u);
+    return bytes | ((bytes & 0x40404040u) << 1);
+#endif
+}
+
+static __device__ __forceinline__ int rocmfpx_unpack_q7_quartet_mmq(
+        const uint32_t packed_word, const int chunk) {
+    // Quartet starts alternate between byte-aligned and nibble-aligned.
+    // LLVM selects one v_bfe_u32 for this constant-width extraction.
+    const uint32_t packed28 = (packed_word >> (4*(chunk & 1))) & 0x0fffffffu;
+    return (int) rocmfpx_spread_q7_to_i8_mmq(packed28);
+}
+
+template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_rocmfpx_fp7(
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + 2*MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q7_0_ROCMFPX, mmq_y);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+
+    // One packed 256-value macroblock fills the same shared-memory tile as
+    // eight Q8_0 blocks. Each logical 32-lane wave expands two quartets.
+    constexpr int threads_per_row = 32;
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_rocmfp7 * bxi = (const block_rocmfp7 *) x + kbx0 + i*stride;
+        const int chunk = txi & 7;
+        const int group = txi >> 3;
+        const int byte_offset = group*QS_ROCMFP7_GROUP + ((7*chunk) >> 1);
+        uint32_t packed_word0;
+        uint32_t packed_word1;
+        // One potentially unaligned dword contains each 28-bit quartet.
+        // The 32 lanes issue contiguous overlapping loads, which coalesce
+        // without the shuffle/funnel overhead of a cooperative gather.
+        memcpy(&packed_word0, bxi->qs +                byte_offset, sizeof(packed_word0));
+        memcpy(&packed_word1, bxi->qs + QS_ROCMFP7/2 + byte_offset, sizeof(packed_word1));
+        const int q0 = rocmfpx_unpack_q7_quartet_mmq(packed_word0, chunk);
+        const int q1 = rocmfpx_unpack_q7_quartet_mmq(packed_word1, chunk);
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + 0             + txi] = q0;
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + MMQ_TILE_NE_K + txi] = q1;
+#else
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + 0             + txi] = q0;
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = q1;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+
+        if (txi < NG_ROCMFP7) {
+            half d;
+            memcpy(&d, &bxi->d[txi], sizeof(d));
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + txi] = __half2float(d);
+#else
+            x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + txi] = __half2float(d);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        }
+    }
+}
+
 template <int mmq_y, bool need_check>
 static __device__ __forceinline__ void load_tiles_mxfp4_fp4(const char * __restrict__ x,
                                                             int * __restrict__ x_tile,
@@ -1645,6 +1747,364 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma(
         }
     }
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+}
+
+template <int mmq_x, int mmq_y, bool need_check>
+static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma_direct(
+        const char * __restrict__ x,
+        const int * __restrict__ y,
+        float * __restrict__ sum,
+        const int kbx0,
+        const int i_max,
+        const int stride_row_x) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+    constexpr data_layout input_layout = get_input_data_layout();
+    typedef tile<16,  8, int, input_layout>        tile_A;
+    typedef tile<16,  8, int, input_layout>        tile_B;
+    typedef tile<16, 16, int, DATA_LAYOUT_J_MAJOR> tile_C;
+
+    constexpr int granularity = mmq_get_granularity_device(mmq_x);
+    constexpr int rows_per_warp = granularity;
+    constexpr int ntx = rows_per_warp / tile_C::I;
+
+    y += (threadIdx.y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
+
+    const int   * y_qs = (const int   *) y + 4;
+    const float * y_df = (const float *) y;
+    const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+        tile_A A[ntx];
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+            int i = i0 + n * tile_A::I + tile_A::get_i(0);
+            if constexpr (need_check) {
+                i = min(i, i_max);
+            }
+            const block_q8_0 * bxi =
+                (const block_q8_0 *) x + kbx0 + i * stride_row_x + k01 / QI8_0;
+            ggml_cuda_memcpy_1<16, 2>(A[n].x + 0, bxi->qs +  0);
+            ggml_cuda_memcpy_1<16, 2>(A[n].x + 4, bxi->qs + 16);
+        }
+
+#pragma unroll
+        for (int j0 = 0; j0 < mmq_x; j0 += ntx * tile_C::J) {
+            tile_B B;
+            load_ldmatrix(B, y_qs + j0 * MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+
+            const int j = j0 + tile_C::get_j(0);
+            const float dB = y_df[j * MMQ_TILE_Y_K + k01 / QI8_1];
+
+#pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                tile_C C;
+                mma(C, A[n], B);
+
+#pragma unroll
+                for (int l = 0; l < tile_C::ne; ++l) {
+                    int i = i0 + n * tile_A::I + tile_C::get_i(l);
+                    if constexpr (need_check) {
+                        i = min(i, i_max);
+                    }
+                    const block_q8_0 * bxi =
+                        (const block_q8_0 *) x + kbx0 + i * stride_row_x + k01 / QI8_0;
+                    const float dA = __half2float(bxi->d);
+                    sum[(j0 / tile_C::J + n) * tile_C::ne + l] +=
+                        C.x[l] * dA * dB;
+                }
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(x, y, sum, kbx0, i_max, stride_row_x);
+    NO_DEVICE_CODE;
+#endif
+}
+
+template <int mmq_x, int mmq_y, bool need_check>
+static __device__ __forceinline__ void vec_dot_rocmfpx_q7_q8_1_mma_direct(
+        const char * __restrict__ x,
+        const int * __restrict__ y,
+        float * __restrict__ sum,
+        const int kbx0,
+        const int group0,
+        const int i_max,
+        const int stride_row_x) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+    constexpr data_layout input_layout = get_input_data_layout();
+    typedef tile<16,  8, int, input_layout>        tile_A;
+    typedef tile<16,  8, int, input_layout>        tile_B;
+    typedef tile<16, 16, int, DATA_LAYOUT_J_MAJOR> tile_C;
+    static_assert(ggml_cuda_get_physical_warp_size() == 32,
+        "ROCmFPX Q7 direct WMMA requires wave32");
+    static_assert(tile_A::ne == 8,
+        "ROCmFPX Q7 direct decoder assumes eight packed A registers");
+
+    constexpr int granularity = mmq_get_granularity_device(mmq_x);
+    constexpr int rows_per_warp = granularity;
+    constexpr int ntx = rows_per_warp / tile_C::I;
+    static_assert(ntx == 1 || ntx == 2,
+        "ROCmFPX Q7 direct decoder supports one or two A row tiles");
+
+    y += (threadIdx.y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
+
+    const int   * y_qs = (const int   *) y + 4;
+    const float * y_df = (const float *) y;
+    const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+
+#pragma unroll 1
+    for (int group_local = 0; group_local < 4; ++group_local) {
+        const int group = group0 + group_local;
+        const int k01 = group_local * QI8_0;
+        tile_A A[ntx];
+        float dA_row[ntx];
+
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+            int i = i0 + n * tile_A::I + tile_A::get_i(0);
+            if constexpr (need_check) {
+                i = min(i, i_max);
+            }
+            const block_rocmfp7 * bxi =
+                (const block_rocmfp7 *) x + kbx0 + i * stride_row_x;
+            const uint8_t * payload = bxi->qs + group * QS_ROCMFP7_GROUP;
+
+            if constexpr (ntx == 1) {
+                const bool high_half = threadIdx.x >= 16;
+                const int chunk0 = high_half ? 4 : 0;
+#pragma unroll
+                for (int chunk_local = 0; chunk_local < 4; ++chunk_local) {
+                    const int chunk = chunk0 + chunk_local;
+                    uint32_t packed_word;
+                    memcpy(
+                        &packed_word,
+                        payload + ((7 * chunk) >> 1),
+                        sizeof(packed_word));
+                    const int decoded =
+                        rocmfpx_unpack_q7_quartet_mmq(packed_word, chunk);
+                    const int mirrored = __builtin_amdgcn_permlanex16(
+                        0,
+                        decoded,
+                        0x76543210,
+                        0xfedcba98,
+                        false,
+                        true);
+                    A[n].x[chunk_local + 0] =
+                        high_half ? mirrored : decoded;
+                    A[n].x[chunk_local + 4] =
+                        high_half ? decoded : mirrored;
+                }
+            } else {
+#pragma unroll
+                for (int chunk = 0; chunk < tile_A::ne; ++chunk) {
+                    uint32_t packed_word;
+                    memcpy(
+                        &packed_word,
+                        payload + ((7 * chunk) >> 1),
+                        sizeof(packed_word));
+                    A[n].x[chunk] =
+                        rocmfpx_unpack_q7_quartet_mmq(packed_word, chunk);
+                }
+            }
+
+            half d;
+            memcpy(&d, &bxi->d[group], sizeof(d));
+            dA_row[n] = __half2float(d);
+        }
+
+#pragma unroll
+        for (int j0 = 0; j0 < mmq_x; j0 += ntx * tile_C::J) {
+            tile_B B;
+            load_ldmatrix(B, y_qs + j0 * MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+
+            const int j = j0 + tile_C::get_j(0);
+            const float dB = y_df[j * MMQ_TILE_Y_K + group_local];
+
+#pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                tile_C C;
+                mma(C, A[n], B);
+
+#pragma unroll
+                for (int l = 0; l < tile_C::ne; ++l) {
+                    // RDNA3's mirrored A layout gives each 16-lane subgroup
+                    // one scale per A row. Shuffle the scale to the C output
+                    // row instead of issuing eight per-output global loads.
+                    const float dA = __shfl_sync(
+                        0xffffffff,
+                        dA_row[n],
+                        tile_C::get_i(l),
+                        tile_A::I);
+                    sum[(j0 / tile_C::J + n) * tile_C::ne + l] +=
+                        C.x[l] * dA * dB;
+                }
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(x, y, sum, kbx0, group0, i_max, stride_row_x);
+    NO_DEVICE_CODE;
+#endif
+}
+
+static __device__ __forceinline__ int
+rocmfpx_load_q7_panel16_quartet_mmq(
+        const block_rocmfp7_panel16 & panel,
+        const int group,
+        const int chunk,
+        const int row_in_panel) {
+    const uint8_t * plane =
+        panel.q[group][ggml_cuda_q7_panel16_quartet_slot(chunk)];
+    uint32_t packed_word;
+    memcpy(
+        &packed_word,
+        plane + ((7 * row_in_panel) >> 1),
+        sizeof(packed_word));
+    return rocmfpx_unpack_q7_quartet_mmq(
+        packed_word,
+        row_in_panel);
+}
+
+template <int mmq_x, int mmq_y, bool need_check>
+static __device__ __forceinline__ void
+vec_dot_rocmfpx_q7_panel16_q8_1_mma_direct(
+        const block_rocmfp7_panel16 * __restrict__ panels,
+        const int * __restrict__ y,
+        float * __restrict__ sum,
+        const int row0,
+        const int macro,
+        const int group0,
+        const int i_max,
+        const int macros_per_row) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+    constexpr data_layout input_layout = get_input_data_layout();
+    typedef tile<16,  8, int, input_layout>        tile_A;
+    typedef tile<16,  8, int, input_layout>        tile_B;
+    typedef tile<16, 16, int, DATA_LAYOUT_J_MAJOR> tile_C;
+    static_assert(ggml_cuda_get_physical_warp_size() == 32,
+        "ROCmFPX Q7 panel16 direct WMMA requires wave32");
+    static_assert(tile_A::ne == GGML_CUDA_Q7_PANEL16_QUARTETS,
+        "ROCmFPX Q7 panel16 decoder assumes eight packed A registers");
+
+    constexpr int granularity = mmq_get_granularity_device(mmq_x);
+    constexpr int rows_per_warp = granularity;
+    constexpr int ntx = rows_per_warp / tile_C::I;
+    static_assert(ntx == 1 || ntx == 2,
+        "ROCmFPX Q7 panel16 decoder supports one or two A row tiles");
+
+    y += (threadIdx.y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
+
+    const int   * y_qs = (const int   *) y + 4;
+    const float * y_df = (const float *) y;
+    const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+
+#pragma unroll 1
+    for (int group_local = 0; group_local < 4; ++group_local) {
+        const int group = group0 + group_local;
+        const int k01 = group_local * QI8_0;
+        tile_A A[ntx];
+        float dA_row[ntx];
+
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+            int i = i0 + n * tile_A::I + tile_A::get_i(0);
+            if constexpr (need_check) {
+                i = min(i, i_max);
+            }
+            const int row = row0 + i;
+            const int row_panel =
+                row / GGML_CUDA_Q7_PANEL16_ROWS;
+            const int row_in_panel =
+                row % GGML_CUDA_Q7_PANEL16_ROWS;
+            const block_rocmfp7_panel16 & panel =
+                panels[
+                    static_cast<size_t>(row_panel) *
+                        macros_per_row +
+                    macro];
+
+            if constexpr (ntx == 1) {
+                const bool high_half = threadIdx.x >= 16;
+                const int chunk0 = high_half ? 4 : 0;
+#pragma unroll
+                for (int chunk_local = 0; chunk_local < 4; ++chunk_local) {
+                    const int chunk = chunk0 + chunk_local;
+                    const int decoded =
+                        rocmfpx_load_q7_panel16_quartet_mmq(
+                            panel,
+                            group,
+                            chunk,
+                            row_in_panel);
+                    const int mirrored = __builtin_amdgcn_permlanex16(
+                        0,
+                        decoded,
+                        0x76543210,
+                        0xfedcba98,
+                        false,
+                        true);
+                    A[n].x[chunk_local + 0] =
+                        high_half ? mirrored : decoded;
+                    A[n].x[chunk_local + 4] =
+                        high_half ? decoded : mirrored;
+                }
+            } else {
+#pragma unroll
+                for (int chunk = 0; chunk < tile_A::ne; ++chunk) {
+                    A[n].x[chunk] =
+                        rocmfpx_load_q7_panel16_quartet_mmq(
+                            panel,
+                            group,
+                            chunk,
+                            row_in_panel);
+                }
+            }
+
+            half d;
+            memcpy(&d, &panel.d[group][row_in_panel], sizeof(d));
+            dA_row[n] = __half2float(d);
+        }
+
+#pragma unroll
+        for (int j0 = 0; j0 < mmq_x; j0 += ntx * tile_C::J) {
+            tile_B B;
+            load_ldmatrix(
+                B,
+                y_qs + j0 * MMQ_TILE_Y_K + k01,
+                MMQ_TILE_Y_K);
+
+            const int j = j0 + tile_C::get_j(0);
+            const float dB =
+                y_df[j * MMQ_TILE_Y_K + group_local];
+
+#pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                tile_C C;
+                mma(C, A[n], B);
+
+#pragma unroll
+                for (int l = 0; l < tile_C::ne; ++l) {
+                    const float dA = __shfl_sync(
+                        0xffffffff,
+                        dA_row[n],
+                        tile_C::get_i(l),
+                        tile_A::I);
+                    sum[(j0 / tile_C::J + n) * tile_C::ne + l] +=
+                        C.x[l] * dA * dB;
+                }
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(
+        panels,
+        y,
+        sum,
+        row0,
+        macro,
+        group0,
+        i_max,
+        macros_per_row);
+    NO_DEVICE_CODE;
+#endif
 }
 
 
@@ -3721,6 +4181,14 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q8_0_ROCMFPX> {
 };
 
 template <int mmq_x, int mmq_y, bool need_check>
+struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q7_0_ROCMFPX> {
+    static constexpr int              vdr          = VDR_Q8_0_Q8_1_MMQ;
+    static constexpr load_tiles_mmq_t load_tiles   = load_tiles_rocmfpx_fp7<mmq_y, need_check>;
+    static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_q8_1_mma<mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>;
+    static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
+};
+
+template <int mmq_x, int mmq_y, bool need_check>
 struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_NVFP4> {
     static constexpr int              vdr          = VDR_NVFP4_Q8_1_MMQ;
 #ifdef BLACKWELL_MMA_AVAILABLE
@@ -3918,10 +4386,200 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     }
 }
 
+template <int mmq_x, bool need_check>
+static __device__ __forceinline__ void mul_mat_q8_0_process_tile_direct(
+        const char * __restrict__ x,
+        const int offset_x,
+        const int * __restrict__ y,
+        const int * __restrict__ ids_dst,
+        float * __restrict__ dst,
+        const int stride_row_x,
+        const int ncols_y,
+        const int stride_col_dst,
+        const int tile_x_max_i,
+        const int tile_y_max_j,
+        const int kb0_start,
+        const int kb0_stop) {
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int mmq_y = get_mmq_y_device();
+    constexpr int blocks_per_iter = MMQ_ITER_K / QK8_0;
+    constexpr int blocks_per_y_mmq = 4;
+    constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
+    constexpr mmq_write_back_t write_back =
+        mmq_write_back_mma<GGML_TYPE_Q8_0, mmq_x, mmq_y, need_check>;
+
+    float sum[mmq_x * mmq_y / (nwarps * warp_size)] = {0.0f};
+
+    for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+        const int y_block = kb0 / blocks_per_y_mmq;
+        const int * y0 = y + ncols_y * y_block * sz;
+        const int * y1 = y0 + ncols_y * sz;
+
+        vec_dot_q8_0_q8_1_mma_direct<mmq_x, mmq_y, need_check>(
+            x, y0, sum, offset_x + kb0, tile_x_max_i, stride_row_x);
+        vec_dot_q8_0_q8_1_mma_direct<mmq_x, mmq_y, need_check>(
+            x,
+            y1,
+            sum,
+            offset_x + kb0 + blocks_per_y_mmq,
+            tile_x_max_i,
+            stride_row_x);
+    }
+
+    write_back(
+        sum,
+        ids_dst,
+        dst,
+        stride_col_dst,
+        tile_x_max_i,
+        tile_y_max_j);
+}
+
+template <int mmq_x, bool need_check>
+static __device__ __forceinline__ void mul_mat_rocmfpx_q7_process_tile_direct(
+        const char * __restrict__ x,
+        const int offset_x,
+        const int * __restrict__ y,
+        const int * __restrict__ ids_dst,
+        float * __restrict__ dst,
+        const int stride_row_x,
+        const int ncols_y,
+        const int stride_col_dst,
+        const int tile_x_max_i,
+        const int tile_y_max_j,
+        const int kb0_start,
+        const int kb0_stop) {
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int mmq_y = get_mmq_y_device();
+    constexpr int blocks_per_iter = MMQ_ITER_K / QK_ROCMFP7;
+    constexpr int y_blocks_per_x = QK_ROCMFP7 / (4 * QK8_1);
+    constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
+    constexpr mmq_write_back_t write_back =
+        mmq_write_back_mma<GGML_TYPE_Q7_0_ROCMFPX, mmq_x, mmq_y, need_check>;
+
+    static_assert(blocks_per_iter == 1, "Q7 direct path expects one macroblock per K iteration");
+    static_assert(y_blocks_per_x == 2, "Q7 direct path expects two Q8_1 panels per macroblock");
+
+    float sum[mmq_x * mmq_y / (nwarps * warp_size)] = {0.0f};
+
+    for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+        const int y_block = kb0 * y_blocks_per_x;
+        const int * y0 = y + ncols_y * y_block * sz;
+        const int * y1 = y0 + ncols_y * sz;
+
+        vec_dot_rocmfpx_q7_q8_1_mma_direct<mmq_x, mmq_y, need_check>(
+            x,
+            y0,
+            sum,
+            offset_x + kb0,
+            0,
+            tile_x_max_i,
+            stride_row_x);
+        vec_dot_rocmfpx_q7_q8_1_mma_direct<mmq_x, mmq_y, need_check>(
+            x,
+            y1,
+            sum,
+            offset_x + kb0,
+            4,
+            tile_x_max_i,
+            stride_row_x);
+    }
+
+    write_back(
+        sum,
+        ids_dst,
+        dst,
+        stride_col_dst,
+        tile_x_max_i,
+        tile_y_max_j);
+}
+
+template <int mmq_x, bool need_check>
+static __device__ __forceinline__ void
+mul_mat_rocmfpx_q7_panel16_process_tile_direct(
+        const block_rocmfp7_panel16 * __restrict__ panels,
+        const int row0,
+        const int * __restrict__ y,
+        const int * __restrict__ ids_dst,
+        float * __restrict__ dst,
+        const int ncols_x,
+        const int ncols_y,
+        const int stride_col_dst,
+        const int tile_x_max_i,
+        const int tile_y_max_j) {
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int mmq_y = get_mmq_y_device();
+    constexpr int y_blocks_per_x = QK_ROCMFP7 / (4 * QK8_1);
+    constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
+    constexpr mmq_write_back_t write_back =
+        mmq_write_back_mma<
+            GGML_TYPE_Q7_0_ROCMFPX,
+            mmq_x,
+            mmq_y,
+            need_check>;
+
+    static_assert(
+        MMQ_ITER_K / QK_ROCMFP7 == 1,
+        "Q7 panel16 direct path expects one macroblock per K iteration");
+    static_assert(
+        y_blocks_per_x == 2,
+        "Q7 panel16 direct path expects two Q8_1 panels per macroblock");
+
+    float sum[mmq_x * mmq_y / (nwarps * warp_size)] = {0.0f};
+    const int macros_per_row = ncols_x / QK_ROCMFP7;
+
+    for (int macro = 0; macro < macros_per_row; ++macro) {
+        const int y_block = macro * y_blocks_per_x;
+        const int * y0 = y + ncols_y * y_block * sz;
+        const int * y1 = y0 + ncols_y * sz;
+
+        vec_dot_rocmfpx_q7_panel16_q8_1_mma_direct<
+            mmq_x,
+            mmq_y,
+            need_check>(
+                panels,
+                y0,
+                sum,
+                row0,
+                macro,
+                0,
+                tile_x_max_i,
+                macros_per_row);
+        vec_dot_rocmfpx_q7_panel16_q8_1_mma_direct<
+            mmq_x,
+            mmq_y,
+            need_check>(
+                panels,
+                y1,
+                sum,
+                row0,
+                macro,
+                4,
+                tile_x_max_i,
+                macros_per_row);
+    }
+
+    write_back(
+        sum,
+        ids_dst,
+        dst,
+        stride_col_dst,
+        tile_x_max_i,
+        tile_y_max_j);
+}
+
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
-template <ggml_type type, int mmq_x, bool need_check>
+template <
+    ggml_type type,
+    int mmq_x,
+    bool need_check,
+    bool q8_0_direct = false,
+    bool rocmfpx_q7_direct = false>
 #if defined(GGML_USE_HIP)
 #if defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
@@ -3940,6 +4598,13 @@ static __global__ void mul_mat_q(
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const uint3 ntx) {
+
+    static_assert(!(q8_0_direct && rocmfpx_q7_direct),
+                  "only one direct MMQ path can be selected");
+    static_assert(!q8_0_direct || type == GGML_TYPE_Q8_0,
+                  "direct Q8 path is only valid for standard Q8_0");
+    static_assert(!rocmfpx_q7_direct || type == GGML_TYPE_Q7_0_ROCMFPX,
+                  "direct Q7 path is only valid for Q7_0_ROCMFPX");
 
     // Skip unused template specializations for faster compilation:
     if (mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
@@ -4021,10 +4686,40 @@ static __global__ void mul_mat_q(
 
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
 
-        constexpr bool fixup = false;
-        mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+        if constexpr (q8_0_direct) {
+            mul_mat_q8_0_process_tile_direct<mmq_x, need_check>(
+                x,
+                offset_x,
+                y + offset_y,
+                ids_dst_shared,
+                dst + offset_dst,
+                stride_row_x,
+                ncols_y,
+                stride_col_dst,
+                tile_x_max_i,
+                tile_y_max_j,
+                0,
+                blocks_per_ne00.z);
+        } else if constexpr (rocmfpx_q7_direct) {
+            mul_mat_rocmfpx_q7_process_tile_direct<mmq_x, need_check>(
+                x,
+                offset_x,
+                y + offset_y,
+                ids_dst_shared,
+                dst + offset_dst,
+                stride_row_x,
+                ncols_y,
+                stride_col_dst,
+                tile_x_max_i,
+                tile_y_max_j,
+                0,
+                blocks_per_ne00.z);
+        } else {
+            constexpr bool fixup = false;
+            mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
+                (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+                 tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+        }
         return;
     }
 #endif // (defined(GGML_USE_HIP) && !defined(CDNA4) && !defined(CDNA3)) || __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
@@ -4176,6 +4871,68 @@ static __global__ void mul_mat_q(
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 }
 
+template <int mmq_x, bool need_check>
+#if defined(GGML_USE_HIP)
+__launch_bounds__(
+    ggml_cuda_get_physical_warp_size() * mmq_get_nwarps_device(),
+    2)
+#endif
+static __global__ void mul_mat_rocmfpx_q7_panel16(
+        const block_rocmfp7_panel16 * __restrict__ panels,
+        const int * __restrict__ y,
+        float * __restrict__ dst,
+        const int ncols_x,
+        const int nrows_x,
+        const int ncols_dst,
+        const int ncols_y,
+        const int stride_col_dst) {
+    static_assert(
+        mmq_x == 16 ||
+        mmq_x == 32 ||
+        mmq_x == 64 ||
+        mmq_x == 128,
+        "Q7 panel16 supports only the measured direct-WMMA tile widths");
+
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int mmq_y = get_mmq_y_device();
+    constexpr int q8_1_mmq_ints =
+        sizeof(block_q8_1_mmq) / sizeof(int);
+
+    extern __shared__ int ids_dst_shared[];
+#pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += nwarps * warp_size) {
+        const int j =
+            j0 + threadIdx.y * warp_size + threadIdx.x;
+        if (j0 + nwarps * warp_size > mmq_x && j >= mmq_x) {
+            break;
+        }
+        ids_dst_shared[j] = j;
+    }
+    __syncthreads();
+
+    const int row0 = static_cast<int>(blockIdx.x) * mmq_y;
+    const int col0 = static_cast<int>(blockIdx.y) * mmq_x;
+    const int tile_x_max_i = nrows_x - row0 - 1;
+    const int tile_y_max_j = ncols_dst - col0 - 1;
+    const int offset_y = col0 * q8_1_mmq_ints;
+    const int offset_dst = row0 + col0 * stride_col_dst;
+
+    mul_mat_rocmfpx_q7_panel16_process_tile_direct<
+        mmq_x,
+        need_check>(
+            panels,
+            row0,
+            y + offset_y,
+            ids_dst_shared,
+            dst + offset_dst,
+            ncols_x,
+            ncols_y,
+            stride_col_dst,
+            tile_x_max_i,
+            tile_y_max_j);
+}
+
 template <ggml_type type, int mmq_x, bool need_check>
 __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device()/2, 1)
 static __global__ void mul_mat_q_stream_k_fixup(
@@ -4315,12 +5072,151 @@ static __global__ void mul_mat_q_stream_k_fixup(
     }
 }
 
+struct mmq_moe_tile {
+    int32_t expert;
+    int32_t tile;
+};
+
+template <int mmq_x>
+static __global__ void build_mmq_moe_tiles(
+        const int32_t * __restrict__ expert_bounds,
+        mmq_moe_tile * __restrict__ expert_tiles,
+        int32_t * __restrict__ nexpert_tiles,
+        const int32_t nexperts) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+
+    // Expert-major order preserves weight locality in the consumer kernel.
+    // The target models have at most 256 experts and only a few hundred
+    // occupied tiles, so a single deterministic producer is cheaper than an
+    // atomic list plus the locality loss from scheduler-dependent ordering.
+    int32_t tile_base = 0;
+    for (int32_t expert = 0; expert < nexperts; ++expert) {
+        const int32_t ncols =
+            expert_bounds[expert + 1] - expert_bounds[expert];
+        const int32_t ntiles = (ncols + mmq_x - 1) / mmq_x;
+        for (int32_t tile = 0; tile < ntiles; ++tile) {
+            expert_tiles[tile_base++] = {expert, tile};
+        }
+    }
+    *nexpert_tiles = tile_base;
+}
+
+template <int mmq_x, bool need_check, bool q8_0_direct>
+static __global__ void mul_mat_q8_0_moe_compact(
+        const char * __restrict__ x,
+        const int * __restrict__ y,
+        const int32_t * __restrict__ ids_dst,
+        const int32_t * __restrict__ expert_bounds,
+        const mmq_moe_tile * __restrict__ expert_tiles,
+        const int32_t * __restrict__ nexpert_tiles,
+        float * __restrict__ dst,
+        const uint3 blocks_per_ne00,
+        const int nrows_x,
+        const int stride_row_x,
+        const int ncols_y,
+        const int stride_col_dst,
+        const int stride_channel_x) {
+    if (mmq_x > get_mmq_x_max_device() ||
+        mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
+        NO_DEVICE_CODE;
+        return;
+    }
+
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int mmq_y = get_mmq_y_device();
+
+    const int32_t expert_tile = blockIdx.y;
+    if (expert_tile >= *nexpert_tiles) {
+        return;
+    }
+
+    const mmq_moe_tile task = expert_tiles[expert_tile];
+    const int32_t expert = task.expert;
+    const int32_t jt = task.tile;
+    const int32_t col_low = expert_bounds[expert + 0];
+    const int32_t col_high = expert_bounds[expert + 1];
+    const int32_t col_diff = col_high - col_low;
+    const int32_t col_start = jt * mmq_x;
+    const int32_t tile_ncols = min(mmq_x, col_diff - col_start);
+
+    extern __shared__ int ids_dst_shared[];
+#pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += nwarps * warp_size) {
+        const int j = j0 + threadIdx.y * warp_size + threadIdx.x;
+        if (j0 + nwarps * warp_size > mmq_x && j >= mmq_x) {
+            break;
+        }
+        ids_dst_shared[j] =
+            j < tile_ncols ?
+                ids_dst[col_low + col_start + j] :
+                0;
+    }
+    __syncthreads();
+
+    const int32_t it = blockIdx.x;
+    const int32_t offset_x =
+        expert * stride_channel_x + it * mmq_y * stride_row_x;
+    const int32_t offset_y =
+        (col_low + col_start) *
+        (sizeof(block_q8_1_mmq) / sizeof(int));
+    const int32_t offset_dst = it * mmq_y;
+    const int32_t tile_x_max_i = nrows_x - it * mmq_y - 1;
+    const int32_t tile_y_max_j = tile_ncols - 1;
+
+    if constexpr (q8_0_direct) {
+        mul_mat_q8_0_process_tile_direct<mmq_x, need_check>(
+            x,
+            offset_x,
+            y + offset_y,
+            ids_dst_shared,
+            dst + offset_dst,
+            stride_row_x,
+            ncols_y,
+            stride_col_dst,
+            tile_x_max_i,
+            tile_y_max_j,
+            0,
+            blocks_per_ne00.z);
+    } else {
+        constexpr bool fixup = false;
+        mul_mat_q_process_tile<
+            GGML_TYPE_Q8_0,
+            mmq_x,
+            need_check,
+            fixup>(
+                x,
+                offset_x,
+                y + offset_y,
+                ids_dst_shared,
+                dst + offset_dst,
+                nullptr,
+                stride_row_x,
+                ncols_y,
+                stride_col_dst,
+                tile_x_max_i,
+                tile_y_max_j,
+                0,
+                blocks_per_ne00.z);
+    }
+}
+
 struct mmq_args {
     const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst; const int32_t * expert_bounds; float * dst;
     int64_t ncols_x; int64_t nrows_x; int64_t ncols_dst; int64_t stride_row_x; int64_t ncols_y; int64_t nrows_dst;
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     bool use_stream_k; int64_t ncols_max;
+    // Optional gfx1151 dual-view cache. x always remains canonical and is
+    // used by every fallback path.
+    const block_rocmfp7_panel16 * x_q7_panel16;
+    bool has_q7_panel16_cache;
+    // Q7 -> standard-Q8 shadow dispatch must stay on the staged Q8 kernel
+    // when only the independent dense Q8 direct-WMMA experiment is enabled.
+    // The separate MoE-only experiment may override this for routed MMQ.
+    bool force_staged_q8 = false;
 };
 
 template<ggml_type type>
@@ -4331,6 +5227,359 @@ static size_t mmq_get_nbytes_shared(const int mmq_x, const int mmq_y, const int 
     const size_t nbs_x = (turing_mma_available(cc) || amd_mfma_available(cc) || amd_wmma_available(cc)) ? mmq_y*mmq_tile_x_k*sizeof(int) : txs.qs*sizeof(int) + txs.dm*sizeof(half2) + txs.sc*sizeof(int);
     const size_t nbs_y = mmq_x * (sizeof(block_q8_1_mmq));
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, nwarps*warp_size*sizeof(int));
+}
+
+static int mmq_gfx1151_q8_0_direct_mode(const int cc) {
+#if defined(GGML_USE_HIP)
+    static const char * value = std::getenv("GGML_ROCM_GFX1151_Q8_0_DIRECT");
+    static const int mode =
+        value == nullptr ? 0 :
+        (std::strcmp(value, "auto") == 0 ? 1 :
+         (std::strcmp(value, "1") == 0 ||
+          std::strcmp(value, "true") == 0 ||
+          std::strcmp(value, "on") == 0 ||
+          std::strcmp(value, "force") == 0) ? 2 : 0);
+    return cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 ? mode : 0;
+#else
+    GGML_UNUSED(cc);
+    return 0;
+#endif
+}
+
+static bool mmq_use_gfx1151_q8_0_direct(const int cc, const int mmq_x, const mmq_args & args) {
+    const int mode = mmq_gfx1151_q8_0_direct_mode(cc);
+    if (mode == 2) {
+        return true;
+    }
+    if (mode != 1 ||
+        mmq_x != 16 ||
+        args.ncols_dst != 16 ||
+        args.ncols_max != 16 ||
+        args.ncols_y != args.ncols_dst ||
+        args.ids_dst != nullptr ||
+        args.expert_bounds != nullptr ||
+        args.nchannels_x != 1 ||
+        args.nchannels_y != 1 ||
+        args.nsamples_x != 1 ||
+        args.nsamples_y != 1 ||
+        args.stride_row_x != args.ncols_x / QK8_0 ||
+        args.nrows_dst != args.nrows_x ||
+        args.ncols_x % MMQ_ITER_K != 0) {
+        return false;
+    }
+
+    // gfx1151 diagnostic medians show a repeatable direct-WMMA win only for
+    // these Qwen-shaped cells. The long MLP projections regress, so keep them
+    // on the staged kernel until a separate layout/kernel proves otherwise.
+    return
+        (args.nrows_x ==  512 && args.ncols_x == 2048) ||
+        (args.nrows_x ==   32 && args.ncols_x == 4096) ||
+        (args.nrows_x == 1024 && args.ncols_x == 4096) ||
+        (args.nrows_x == 4096 && args.ncols_x == 4096);
+}
+
+static int mmq_gfx1151_q8_0_moe_direct_mode(const int cc) {
+#if defined(GGML_USE_HIP)
+    static const char * value = std::getenv("GGML_ROCM_GFX1151_Q8_0_MOE_DIRECT");
+    static const int mode =
+        value == nullptr ? 0 :
+        (std::strcmp(value, "auto") == 0 ? 1 :
+         (std::strcmp(value, "1") == 0 ||
+          std::strcmp(value, "true") == 0 ||
+          std::strcmp(value, "on") == 0 ||
+          std::strcmp(value, "force") == 0) ? 2 : 0);
+    return cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 ? mode : 0;
+#else
+    GGML_UNUSED(cc);
+    return 0;
+#endif
+}
+
+static bool mmq_use_gfx1151_q8_0_moe_direct(
+        const int cc, const int mmq_x, const mmq_args & args) {
+    const int mode = mmq_gfx1151_q8_0_moe_direct_mode(cc);
+    if (mode == 0) {
+        return false;
+    }
+
+    // This gate is deliberately disjoint from the dense direct-Q8
+    // experiment. It accepts only the compacted MUL_MAT_ID representation
+    // produced by ggml_cuda_launch_mm_ids_helper.
+    const bool routed_contiguous =
+        args.ids_dst != nullptr &&
+        args.expert_bounds != nullptr &&
+        args.ncols_y == args.ncols_dst &&
+        args.ncols_dst > 0 &&
+        args.ncols_max > 0 &&
+        args.nchannels_x == args.nchannels_y &&
+        args.nchannels_x > 1 &&
+        args.nsamples_x == 1 &&
+        args.nsamples_y == 1 &&
+        args.stride_row_x == args.ncols_x / QK8_0 &&
+        args.nrows_dst == args.nrows_x &&
+        args.ncols_x % MMQ_ITER_K == 0;
+
+    if (!routed_contiguous) {
+        return false;
+    }
+
+    const bool supported_tile =
+        mmq_x == 8 ||
+        mmq_x == 16 ||
+        mmq_x == 24 ||
+        mmq_x == 32 ||
+        mmq_x == 40 ||
+        mmq_x == 48 ||
+        mmq_x == 56 ||
+        mmq_x == 64 ||
+        mmq_x == 72 ||
+        mmq_x == 80 ||
+        mmq_x == 88 ||
+        mmq_x == 96 ||
+        mmq_x == 104 ||
+        mmq_x == 112 ||
+        mmq_x == 120 ||
+        mmq_x == 128;
+    if (!supported_tile) {
+        return false;
+    }
+
+    // "force" exposes structurally valid routed shapes for the operator
+    // matrix. "auto" is intentionally only the Ornith gate/up mean-N=16
+    // cell that motivated this experiment; promotion requires real routed
+    // correctness, timing, and model evidence.
+    if (mode == 2) {
+        return true;
+    }
+
+    const int64_t ncols_typical =
+        (args.ncols_dst + args.nchannels_x - 1) / args.nchannels_x;
+    return
+        mmq_x == 16 &&
+        ncols_typical == 16 &&
+        args.nrows_x == 512 &&
+        args.ncols_x == 2048;
+}
+
+static bool mmq_use_gfx1151_q8_0_moe_compact(
+        const int cc, const mmq_args & args) {
+#if defined(GGML_USE_HIP)
+    static const char * value =
+        std::getenv("GGML_ROCM_GFX1151_Q8_0_MOE_COMPACT");
+    const bool enabled =
+        value != nullptr &&
+        (std::strcmp(value, "1") == 0 ||
+         std::strcmp(value, "true") == 0 ||
+         std::strcmp(value, "on") == 0 ||
+         std::strcmp(value, "force") == 0);
+    return
+        enabled &&
+        cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
+        args.ids_dst != nullptr &&
+        args.expert_bounds != nullptr &&
+        args.ncols_y == args.ncols_dst &&
+        args.ncols_dst > 0 &&
+        args.ncols_max > 0 &&
+        args.nchannels_x == args.nchannels_y &&
+        args.nchannels_x > 1 &&
+        args.nsamples_x == 1 &&
+        args.nsamples_y == 1 &&
+        args.stride_row_x == args.ncols_x / QK8_0 &&
+        args.nrows_dst == args.nrows_x;
+#else
+    GGML_UNUSED(cc);
+    GGML_UNUSED(args);
+    return false;
+#endif
+}
+
+static int mmq_gfx1151_q8_0_moe_tile_override(const int cc) {
+#if defined(GGML_USE_HIP)
+    static const char * value =
+        std::getenv("GGML_ROCM_GFX1151_Q8_0_MOE_TILE");
+    static const bool instella_auto =
+        value != nullptr &&
+        std::strcmp(value, "instella-auto") == 0;
+    static const int tile =
+        value == nullptr ? 0 : std::atoi(value);
+    if (cc != GGML_CUDA_CC_OFFSET_AMD + 0x1151) {
+        return 0;
+    }
+    if (instella_auto) {
+        return -1;
+    }
+    switch (tile) {
+        case 8:
+        case 16:
+        case 24:
+        case 32:
+        case 40:
+        case 48:
+        case 56:
+        case 64:
+        case 72:
+        case 80:
+        case 88:
+        case 96:
+        case 104:
+        case 112:
+        case 120:
+        case 128:
+            return tile;
+        default:
+            return 0;
+    }
+#else
+    GGML_UNUSED(cc);
+    return 0;
+#endif
+}
+
+static int mmq_gfx1151_q8_0_instella_moe_tile(
+        const mmq_args & args) {
+    const bool instella_routing =
+        args.expert_bounds != nullptr &&
+        args.nchannels_x == 64 &&
+        args.nchannels_y == 64 &&
+        args.ncols_max > 0 &&
+        args.ncols_dst == 6 * args.ncols_max;
+    const bool gate_or_up =
+        args.nrows_x == 1408 &&
+        args.ncols_x == 2048;
+    const bool down =
+        args.nrows_x == 2048 &&
+        args.ncols_x == 1408;
+    if (!instella_routing || (!gate_or_up && !down)) {
+        return 0;
+    }
+
+    // Real BF16 Instella router traces on gfx1151, all 26 routed layers:
+    //   N=192: x16 wins the model FFN sum by 1.38%.
+    //   N=224: x48 wins by 2.47%.
+    //   N=768: x48 wins by 0.95%.
+    //   N=832: x64 wins by 1.17%.
+    // Use midpoint thresholds between the measured prompt lengths.
+    if (args.ncols_max <= 208) {
+        return 16;
+    }
+    if (args.ncols_max <= 800) {
+        return 48;
+    }
+    return 64;
+}
+
+static int mmq_gfx1151_rocmfpx_q7_direct_mode(const int cc) {
+#if defined(GGML_USE_HIP)
+    static const char * value = std::getenv("GGML_ROCM_GFX1151_Q7_0_DIRECT");
+    static const int mode =
+        value == nullptr ? 0 :
+        (std::strcmp(value, "auto") == 0 ? 1 :
+         (std::strcmp(value, "1") == 0 ||
+          std::strcmp(value, "true") == 0 ||
+          std::strcmp(value, "on") == 0 ||
+          std::strcmp(value, "force") == 0) ? 2 : 0);
+    return cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 ? mode : 0;
+#else
+    GGML_UNUSED(cc);
+    return 0;
+#endif
+}
+
+static bool mmq_use_gfx1151_rocmfpx_q7_direct(
+        const int cc, const int mmq_x, const mmq_args & args) {
+    const int mode = mmq_gfx1151_rocmfpx_q7_direct_mode(cc);
+    if (mode == 0) {
+        return false;
+    }
+
+    const bool plain_contiguous =
+        args.ncols_y == args.ncols_dst &&
+        args.ncols_max == args.ncols_dst &&
+        args.ids_dst == nullptr &&
+        args.expert_bounds == nullptr &&
+        args.nchannels_x == 1 &&
+        args.nchannels_y == 1 &&
+        args.nsamples_x == 1 &&
+        args.nsamples_y == 1 &&
+        args.stride_row_x == args.ncols_x / QK_ROCMFP7 &&
+        args.nrows_dst == args.nrows_x &&
+        args.ncols_x % MMQ_ITER_K == 0;
+
+    if (!plain_contiguous) {
+        return false;
+    }
+
+    // "auto" is an exact gfx1151 evidence whitelist. Keep unmeasured shapes
+    // and the observed wide long-projection regressions on the staged path.
+    // Force-style modes (1/true/on/force) expose all four tile widths for
+    // exhaustive diagnostics.
+    if (mode == 1) {
+        const bool square_4096 =
+            args.nrows_x == 4096 && args.ncols_x == 4096;
+        const bool down_12288 =
+            args.nrows_x == 4096 && args.ncols_x == 12288;
+        const bool up_12288 =
+            args.nrows_x == 12288 && args.ncols_x == 4096;
+
+        switch (args.ncols_dst) {
+            case 16:
+                return mmq_x == 16 && (square_4096 || down_12288);
+            case 32:
+                return mmq_x == 32 && square_4096;
+            case 64:
+                return mmq_x == 64 &&
+                    (square_4096 || down_12288 || up_12288);
+            case 128:
+                return mmq_x == 128 &&
+                    (square_4096 || down_12288 || up_12288);
+            case 256:
+            case 512:
+                return mmq_x == 128 && square_4096;
+            default:
+                return false;
+        }
+    }
+
+    const bool supported_tile =
+        mmq_x == 16 ||
+        mmq_x == 32 ||
+        mmq_x == 64 ||
+        mmq_x == 128;
+    return
+        supported_tile &&
+        args.ncols_dst % mmq_x == 0;
+}
+
+static bool mmq_use_gfx1151_rocmfpx_q7_panel16(
+        const int cc,
+        const int mmq_x,
+        const mmq_args & args) {
+    const bool supported_tile =
+        mmq_x == 16 ||
+        mmq_x == 32 ||
+        mmq_x == 64 ||
+        mmq_x == 128;
+    return
+        supported_tile &&
+        args.x_q7_panel16 != nullptr &&
+        args.has_q7_panel16_cache &&
+        ggml_cuda_q7_panel16_cache_eligible(
+            cc,
+            args.type_x,
+            args.nrows_x,
+            args.ncols_x,
+            args.stride_row_x) &&
+        args.ncols_y == args.ncols_dst &&
+        args.ncols_max == args.ncols_dst &&
+        args.ncols_dst > 0 &&
+        args.ncols_dst % mmq_x == 0 &&
+        args.ids_dst == nullptr &&
+        args.expert_bounds == nullptr &&
+        args.nchannels_x == 1 &&
+        args.nchannels_y == 1 &&
+        args.nsamples_x == 1 &&
+        args.nsamples_y == 1 &&
+        args.nrows_dst == args.nrows_x;
 }
 
 template <ggml_type type, int mmq_x>
@@ -4365,6 +5614,275 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 nsamples_y_fd      = init_fastdiv_values(args.nsamples_y);
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
+
+#if defined(GGML_USE_HIP)
+    if constexpr (type == GGML_TYPE_Q8_0) {
+        if (!args.use_stream_k &&
+            mmq_use_gfx1151_q8_0_moe_compact(cc, args)) {
+            const int64_t expert_tile_capacity_64 =
+                (args.ncols_dst +
+                 args.nchannels_y * (mmq_x - 1) +
+                 mmq_x - 1) /
+                mmq_x;
+            GGML_ASSERT(
+                expert_tile_capacity_64 > 0 &&
+                expert_tile_capacity_64 <= INT_MAX);
+            const int expert_tile_capacity =
+                static_cast<int>(expert_tile_capacity_64);
+
+            ggml_cuda_pool_alloc<mmq_moe_tile> expert_tiles(
+                ctx.pool(),
+                expert_tile_capacity);
+            ggml_cuda_pool_alloc<int32_t> nexpert_tiles(ctx.pool(), 1);
+            build_mmq_moe_tiles<mmq_x><<<
+                1,
+                1,
+                0,
+                stream>>>(
+                    args.expert_bounds,
+                    expert_tiles.get(),
+                    nexpert_tiles.get(),
+                    args.nchannels_y);
+
+            const dim3 block_nums_moe_compact(
+                nty,
+                expert_tile_capacity,
+                1);
+            const bool use_direct =
+                mmq_use_gfx1151_q8_0_moe_direct(
+                    cc,
+                    mmq_x,
+                    args);
+            if (use_direct) {
+                const size_t nbytes_shared_direct =
+                    mmq_x * sizeof(int);
+                if (args.nrows_x % mmq_y == 0) {
+                    constexpr bool need_check = false;
+                    mul_mat_q8_0_moe_compact<
+                        mmq_x,
+                        need_check,
+                        true><<<
+                            block_nums_moe_compact,
+                            block_dims,
+                            nbytes_shared_direct,
+                            stream>>>(
+                                args.x,
+                                args.y,
+                                args.ids_dst,
+                                args.expert_bounds,
+                                expert_tiles.get(),
+                                nexpert_tiles.get(),
+                                args.dst,
+                                blocks_per_ne00_fd,
+                                args.nrows_x,
+                                args.stride_row_x,
+                                args.ncols_y,
+                                args.nrows_dst,
+                                args.stride_channel_x);
+                } else {
+                    constexpr bool need_check = true;
+                    mul_mat_q8_0_moe_compact<
+                        mmq_x,
+                        need_check,
+                        true><<<
+                            block_nums_moe_compact,
+                            block_dims,
+                            nbytes_shared_direct,
+                            stream>>>(
+                                args.x,
+                                args.y,
+                                args.ids_dst,
+                                args.expert_bounds,
+                                expert_tiles.get(),
+                                nexpert_tiles.get(),
+                                args.dst,
+                                blocks_per_ne00_fd,
+                                args.nrows_x,
+                                args.stride_row_x,
+                                args.ncols_y,
+                                args.nrows_dst,
+                                args.stride_channel_x);
+                }
+            } else {
+                CUDA_SET_SHARED_MEMORY_LIMIT(
+                    (mul_mat_q8_0_moe_compact<
+                        mmq_x,
+                        false,
+                        false>),
+                    nbytes_shared);
+                CUDA_SET_SHARED_MEMORY_LIMIT(
+                    (mul_mat_q8_0_moe_compact<
+                        mmq_x,
+                        true,
+                        false>),
+                    nbytes_shared);
+                if (args.nrows_x % mmq_y == 0) {
+                    constexpr bool need_check = false;
+                    mul_mat_q8_0_moe_compact<
+                        mmq_x,
+                        need_check,
+                        false><<<
+                            block_nums_moe_compact,
+                            block_dims,
+                            nbytes_shared,
+                            stream>>>(
+                                args.x,
+                                args.y,
+                                args.ids_dst,
+                                args.expert_bounds,
+                                expert_tiles.get(),
+                                nexpert_tiles.get(),
+                                args.dst,
+                                blocks_per_ne00_fd,
+                                args.nrows_x,
+                                args.stride_row_x,
+                                args.ncols_y,
+                                args.nrows_dst,
+                                args.stride_channel_x);
+                } else {
+                    constexpr bool need_check = true;
+                    mul_mat_q8_0_moe_compact<
+                        mmq_x,
+                        need_check,
+                        false><<<
+                            block_nums_moe_compact,
+                            block_dims,
+                            nbytes_shared,
+                            stream>>>(
+                                args.x,
+                                args.y,
+                                args.ids_dst,
+                                args.expert_bounds,
+                                expert_tiles.get(),
+                                nexpert_tiles.get(),
+                                args.dst,
+                                blocks_per_ne00_fd,
+                                args.nrows_x,
+                                args.stride_row_x,
+                                args.ncols_y,
+                                args.nrows_dst,
+                                args.stride_channel_x);
+                }
+            }
+            return;
+        }
+        if (!args.use_stream_k &&
+            ((!args.force_staged_q8 &&
+              mmq_use_gfx1151_q8_0_direct(cc, mmq_x, args)) ||
+             mmq_use_gfx1151_q8_0_moe_direct(cc, mmq_x, args))) {
+            const size_t nbytes_shared_direct = mmq_x * sizeof(int);
+            if (args.nrows_x % mmq_y == 0) {
+                constexpr bool need_check = false;
+                mul_mat_q<type, mmq_x, need_check, true><<<
+                    block_nums_xy_tiling,
+                    block_dims,
+                    nbytes_shared_direct,
+                    stream>>>(
+                    args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                    blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                    channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                    sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                    ntx_fd);
+            } else {
+                constexpr bool need_check = true;
+                mul_mat_q<type, mmq_x, need_check, true><<<
+                    block_nums_xy_tiling,
+                    block_dims,
+                    nbytes_shared_direct,
+                    stream>>>(
+                    args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                    blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                    channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                    sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                    ntx_fd);
+            }
+            return;
+        }
+    }
+    if constexpr (
+        type == GGML_TYPE_Q7_0_ROCMFPX &&
+        (mmq_x == 16 || mmq_x == 32 || mmq_x == 64 || mmq_x == 128)) {
+        if (!args.use_stream_k &&
+            mmq_use_gfx1151_rocmfpx_q7_panel16(
+                cc,
+                mmq_x,
+                args)) {
+            const size_t nbytes_shared_direct =
+                mmq_x * sizeof(int);
+            if (args.nrows_x % mmq_y == 0) {
+                constexpr bool need_check = false;
+                mul_mat_rocmfpx_q7_panel16<
+                    mmq_x,
+                    need_check><<<
+                        block_nums_xy_tiling,
+                        block_dims,
+                        nbytes_shared_direct,
+                        stream>>>(
+                            args.x_q7_panel16,
+                            args.y,
+                            args.dst,
+                            args.ncols_x,
+                            args.nrows_x,
+                            args.ncols_dst,
+                            args.ncols_y,
+                            args.nrows_dst);
+            } else {
+                constexpr bool need_check = true;
+                mul_mat_rocmfpx_q7_panel16<
+                    mmq_x,
+                    need_check><<<
+                        block_nums_xy_tiling,
+                        block_dims,
+                        nbytes_shared_direct,
+                        stream>>>(
+                            args.x_q7_panel16,
+                            args.y,
+                            args.dst,
+                            args.ncols_x,
+                            args.nrows_x,
+                            args.ncols_dst,
+                            args.ncols_y,
+                            args.nrows_dst);
+            }
+            ggml_cuda_q7_panel16_note_kernel_launch(
+                mmq_x,
+                args.nrows_x,
+                args.ncols_x,
+                args.ncols_dst);
+            return;
+        }
+        if (!args.use_stream_k &&
+            mmq_use_gfx1151_rocmfpx_q7_direct(cc, mmq_x, args)) {
+            const size_t nbytes_shared_direct = mmq_x * sizeof(int);
+            if (args.nrows_x % mmq_y == 0) {
+                constexpr bool need_check = false;
+                mul_mat_q<type, mmq_x, need_check, false, true><<<
+                    block_nums_xy_tiling,
+                    block_dims,
+                    nbytes_shared_direct,
+                    stream>>>(
+                    args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                    blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                    channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                    sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                    ntx_fd);
+            } else {
+                constexpr bool need_check = true;
+                mul_mat_q<type, mmq_x, need_check, false, true><<<
+                    block_nums_xy_tiling,
+                    block_dims,
+                    nbytes_shared_direct,
+                    stream>>>(
+                    args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                    blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                    channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                    sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                    ntx_fd);
+            }
+            return;
+        }
+    }
+#endif
 
     if (!args.use_stream_k) {
         if (args.nrows_x % mmq_y == 0) {
@@ -4486,6 +6004,33 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
         }
     }
 
+#if defined(GGML_USE_HIP)
+    if constexpr (type == GGML_TYPE_Q8_0) {
+        if (args.expert_bounds != nullptr) {
+            const int tile_override =
+                mmq_gfx1151_q8_0_moe_tile_override(cc);
+            const int selected_tile =
+                tile_override == -1 ?
+                    mmq_gfx1151_q8_0_instella_moe_tile(args) :
+                    tile_override;
+            if (selected_tile != 0) {
+                const int granularity =
+                    mmq_get_granularity_host(selected_tile, cc);
+                GGML_ASSERT(
+                    selected_tile <= mmq_x_max &&
+                    selected_tile % granularity == 0 &&
+                    mmq_get_nbytes_shared<type>(
+                        selected_tile,
+                        mmq_y,
+                        cc,
+                        warp_size,
+                        nwarps) <= smpbo);
+                mmq_x_best = selected_tile;
+            }
+        }
+    }
+#endif
+
     switch (mmq_x_best) {
         case   8:
             launch_mul_mat_q<type,   8>(ctx, args, stream);
@@ -4555,6 +6100,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_Q4_0_ROCMFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_Q4_0_ROCMFP4_FAST);
 extern DECL_MMQ_CASE(GGML_TYPE_Q3_0_ROCMFPX);
 extern DECL_MMQ_CASE(GGML_TYPE_Q6_0_ROCMFPX);
+extern DECL_MMQ_CASE(GGML_TYPE_Q7_0_ROCMFPX);
 extern DECL_MMQ_CASE(GGML_TYPE_Q8_0_ROCMFPX);
 extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_Q2_K);

@@ -1137,6 +1137,26 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // A server slot can be reused after its target and draft KV sequences
+        // are cleared. pending_h is state outside those contexts, so reset it
+        // when a fresh sequence starts at position zero. Otherwise the first
+        // MTP prefill row consumes the previous request's final hidden state,
+        // making identical uncached requests depend on slot history.
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            const int32_t i_beg = i_batch_beg[seq_id];
+            if (i_beg < 0 || batch_in.pos[i_beg] != 0) {
+                continue;
+            }
+
+            std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+            last_n_drafted[seq_id] = 0;
+            drafting[seq_id] = 0;
+            i_last[seq_id] = -1;
+            if (chain_heads) {
+                chain_h[seq_id].clear();
+            }
+        }
+
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 

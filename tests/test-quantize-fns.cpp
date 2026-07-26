@@ -102,6 +102,23 @@ static float dot_product_error(const ggml_type_traits * qfns, const ggml_type_tr
     return fabsf(result - dot_ref) / test_size;
 }
 
+static bool q7_rocmfpx_underflow_is_zeroed() {
+    const auto * qfns_cpu = ggml_get_type_traits_cpu(GGML_TYPE_Q7_0_ROCMFPX);
+    std::vector<float> tiny(256);
+    for (size_t i = 0; i < tiny.size(); ++i) {
+        tiny[i] = (i & 1 ? -1.0f : 1.0f)*(1.0e-9f + (float) i*1.0e-12f);
+    }
+
+    std::vector<uint8_t> packed(ggml_row_size(GGML_TYPE_Q7_0_ROCMFPX, tiny.size()), 0xa5);
+    qfns_cpu->from_float(tiny.data(), packed.data(), tiny.size());
+    for (uint8_t byte : packed) {
+        if (byte != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
     const size_t test_size = 32 * 128;
@@ -188,6 +205,12 @@ int main(int argc, char * argv[]) {
                 printf("%5s dot product error:              %s (%f)\n", ggml_type_name(type), RESULT_STR[failed], vec_dot_error);
             }
         }
+    }
+
+    failed = !q7_rocmfpx_underflow_is_zeroed();
+    num_failed += failed;
+    if (failed || verbose) {
+        printf("q7_0_rocmfpx underflow payload zeroing: %s\n", RESULT_STR[failed]);
     }
 
     if (num_failed || verbose) {

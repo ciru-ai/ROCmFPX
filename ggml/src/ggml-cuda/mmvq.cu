@@ -4,6 +4,8 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 #ifndef GGML_ROCMFP4_RDNA35_NWARPS
 #define GGML_ROCMFP4_RDNA35_NWARPS 2
@@ -56,6 +58,15 @@
 
 #ifndef GGML_ROCMFPX_RDNA35_NWARPS
 #define GGML_ROCMFPX_RDNA35_NWARPS 1
+#endif
+
+#ifndef GGML_Q8_0_RDNA35_NWARPS
+#define GGML_Q8_0_RDNA35_NWARPS 1
+#endif
+
+#if GGML_Q8_0_RDNA35_NWARPS != 1 && GGML_Q8_0_RDNA35_NWARPS != 2 && \
+    GGML_Q8_0_RDNA35_NWARPS != 4 && GGML_Q8_0_RDNA35_NWARPS != 8
+#error "GGML_Q8_0_RDNA35_NWARPS must be one of: 1, 2, 4, 8"
 #endif
 
 #if GGML_ROCMFPX_RDNA35_NWARPS != 1 && GGML_ROCMFPX_RDNA35_NWARPS != 2 && \
@@ -124,6 +135,8 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
                                 return vec_dot_rocmfpx_fp6_q8_1;
         case GGML_TYPE_Q8_0_ROCMFPX:
                                 return vec_dot_rocmfpx_fp8_q8_1;
+        case GGML_TYPE_Q7_0_ROCMFPX:
+                                return vec_dot_rocmfpx_q7_q8_1;
         case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
         case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
         case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
@@ -162,6 +175,8 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
                                 return VDR_ROCMFP6_Q8_1_MMVQ;
         case GGML_TYPE_Q8_0_ROCMFPX:
                                 return VDR_ROCMFP8_Q8_1_MMVQ;
+        case GGML_TYPE_Q7_0_ROCMFPX:
+                                return VDR_ROCMFP7_Q8_1_MMVQ;
         case GGML_TYPE_NVFP4:   return VDR_NVFP4_Q8_1_MMVQ;
         case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
         case GGML_TYPE_Q3_K:    return VDR_Q3_K_Q8_1_MMVQ;
@@ -351,6 +366,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna3_5(ggml_ty
         case GGML_TYPE_Q3_0_ROCMFPX:
         case GGML_TYPE_Q6_0_ROCMFPX:
         case GGML_TYPE_Q8_0_ROCMFPX:
+        case GGML_TYPE_Q7_0_ROCMFPX:
                                 return GGML_ROCMFPX_RDNA35_MMID_MAX_BATCH;
         default:                return get_mmvq_mmid_max_batch_rdna3(type);
     }
@@ -550,6 +566,9 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         return 1;
     }
     if (table_id == MMVQ_PARAMETERS_RDNA3_5) {
+        if (type == GGML_TYPE_Q8_0 && ncols_dst == 1) {
+            return GGML_Q8_0_RDNA35_NWARPS;
+        }
         if (ncols_dst >= 1 && ncols_dst <= GGML_ROCMFP4_RDNA35_NWARPS_MAX_NCOLS) {
             switch (type) {
                 case GGML_TYPE_Q4_0_ROCMFP4:
@@ -558,6 +577,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 case GGML_TYPE_Q3_0_ROCMFPX:
                 case GGML_TYPE_Q6_0_ROCMFPX:
                 case GGML_TYPE_Q8_0_ROCMFPX:
+                case GGML_TYPE_Q7_0_ROCMFPX:
                     if (ncols_dst <= GGML_ROCMFPX_RDNA35_NWARPS_MAX_NCOLS) {
                         return GGML_ROCMFPX_RDNA35_NWARPS;
                     }
@@ -618,6 +638,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
                 case GGML_TYPE_Q3_0_ROCMFPX:
                 case GGML_TYPE_Q6_0_ROCMFPX:
                 case GGML_TYPE_Q8_0_ROCMFPX:
+                case GGML_TYPE_Q7_0_ROCMFPX:
                     return GGML_ROCMFPX_RDNA35_RPB_WIDE;
                 default:
                     break;
@@ -633,7 +654,8 @@ static constexpr int calc_moe_mmvq_rows_per_block() {
     if constexpr (type == GGML_TYPE_Q4_0_ROCMFP4 || type == GGML_TYPE_Q4_0_ROCMFP4_FAST) {
         return GGML_ROCMFP4_MOE_MMVQ_ROWS_PER_BLOCK;
     }
-    if constexpr (type == GGML_TYPE_Q3_0_ROCMFPX || type == GGML_TYPE_Q6_0_ROCMFPX || type == GGML_TYPE_Q8_0_ROCMFPX) {
+    if constexpr (type == GGML_TYPE_Q3_0_ROCMFPX || type == GGML_TYPE_Q6_0_ROCMFPX ||
+                  type == GGML_TYPE_Q8_0_ROCMFPX || type == GGML_TYPE_Q7_0_ROCMFPX) {
         return GGML_ROCMFPX_MOE_MMVQ_ROWS_PER_BLOCK;
     }
 #endif
@@ -853,6 +875,305 @@ static __global__ void mul_mat_vec_q(
     }
 }
 
+// gfx1151 standard-Q8 register outer-product experiment for small-column MMVQ.
+//
+// The stock kernel assigns one wave to one output row. This 2-D tile assigns a
+// wave to a small row x token rectangle so both weights and activations can be
+// reused without an inter-wave reduction or LDS. The common N=4, T=2, R=2
+// instance is:
+//
+//   wave 0: rows [r, r+1] x tokens [0, 1]
+//   wave 1: rows [r, r+1] x tokens [2, 3]
+//
+// The canonical block_q8_0 and block_q8_1 representations are consumed
+// directly. Arithmetic remains signed dot4 with the original FP16 scales. To
+// limit live ranges, the shorter tile dimension is retained while the longer
+// dimension is streamed through the dot-product body.
+template <int ncols_dst, int tokens_per_wave, int rows_per_block>
+__launch_bounds__((ncols_dst/tokens_per_wave)*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q8_0_rdna35_2d(
+        const void * __restrict__ vx,
+        const void * __restrict__ vy,
+        float * __restrict__ dst,
+        const uint32_t ncols_x,
+        const uint32_t nrows_x,
+        const uint32_t stride_row_x,
+        const uint32_t stride_col_y,
+        const uint32_t stride_col_dst,
+        const uint3 channel_ratio,
+        const uint32_t stride_channel_x,
+        const uint32_t stride_channel_y,
+        const uint32_t stride_channel_dst,
+        const uint3 sample_ratio,
+        const uint32_t stride_sample_x,
+        const uint32_t stride_sample_y,
+        const uint32_t stride_sample_dst) {
+    static_assert(
+        tokens_per_wave == 1 || tokens_per_wave == 2 || tokens_per_wave == 4,
+        "tokens_per_wave must be a small power of two");
+    static_assert(ncols_dst % tokens_per_wave == 0);
+    static_assert(rows_per_block >= 1 && rows_per_block <= 8);
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int qk = QK8_0;
+    constexpr int qi = QI8_0;
+    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
+    constexpr int blocks_per_iter = vdr*warp_size/qi;
+
+    const int lane = threadIdx.x;
+    const int token0 = threadIdx.y*tokens_per_wave;
+    const int row0 = rows_per_block*blockIdx.x;
+    const int blocks_per_row_x = ncols_x/qk;
+    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t sample_dst = blockIdx.z;
+    const uint32_t channel_x = fastdiv(channel_dst, channel_ratio);
+    const uint32_t channel_y = channel_dst;
+    const uint32_t sample_x = fastdiv(sample_dst, sample_ratio);
+    const uint32_t sample_y = sample_dst;
+
+    const block_q8_1 * y =
+        (const block_q8_1 *) vy +
+        sample_y*stride_sample_y +
+        channel_y*stride_channel_y;
+    const int kbx_offset =
+        sample_x*stride_sample_x +
+        channel_x*stride_channel_x +
+        row0*stride_row_x;
+
+    float tmp[tokens_per_wave][rows_per_block] = {{0.0f}};
+
+    for (int kbx = lane/(qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kqs = vdr*(lane % (qi/vdr));
+
+        if constexpr (rows_per_block <= tokens_per_wave) {
+            // Retain the smaller row side, then stream one activation tuple at
+            // a time. This is the R2T4 schedule used by the strongest N=4/8
+            // candidates.
+            int w0[rows_per_block];
+            int w1[rows_per_block];
+            float wd[rows_per_block];
+#pragma unroll
+            for (int row = 0; row < rows_per_block; ++row) {
+                const int safe_row = min(row0 + row, int(nrows_x) - 1);
+                const block_q8_0 * wb =
+                    (const block_q8_0 *) vx +
+                    kbx_offset +
+                    (safe_row - row0)*stride_row_x +
+                    kbx;
+                w0[row] = get_int_b2(wb->qs, kqs + 0);
+                w1[row] = get_int_b2(wb->qs, kqs + 1);
+                wd[row] = __half2float(wb->d);
+            }
+
+#pragma unroll
+            for (int token = 0; token < tokens_per_wave; ++token) {
+                const block_q8_1 * ab =
+                    y + (token0 + token)*stride_col_y + kbx;
+                const int a0 = get_int_b4(ab->qs, kqs + 0);
+                const int a1 = get_int_b4(ab->qs, kqs + 1);
+                const float ad = __half2float(__low2half(ab->ds));
+#pragma unroll
+                for (int row = 0; row < rows_per_block; ++row) {
+                    int sumi = ggml_cuda_dp4a(w0[row], a0, 0);
+                    sumi = ggml_cuda_dp4a(w1[row], a1, sumi);
+                    tmp[token][row] += wd[row]*ad*float(sumi);
+                }
+            }
+        } else {
+            // Retain the smaller token side, then stream one weight tuple at a
+            // time. This is the R4T2 schedule and the N=1 row-folding schedule.
+            int a0[tokens_per_wave];
+            int a1[tokens_per_wave];
+            float ad[tokens_per_wave];
+#pragma unroll
+            for (int token = 0; token < tokens_per_wave; ++token) {
+                const block_q8_1 * ab =
+                    y + (token0 + token)*stride_col_y + kbx;
+                a0[token] = get_int_b4(ab->qs, kqs + 0);
+                a1[token] = get_int_b4(ab->qs, kqs + 1);
+                ad[token] = __half2float(__low2half(ab->ds));
+            }
+
+#pragma unroll
+            for (int row = 0; row < rows_per_block; ++row) {
+                const int safe_row = min(row0 + row, int(nrows_x) - 1);
+                const block_q8_0 * wb =
+                    (const block_q8_0 *) vx +
+                    kbx_offset +
+                    (safe_row - row0)*stride_row_x +
+                    kbx;
+                const int w0 = get_int_b2(wb->qs, kqs + 0);
+                const int w1 = get_int_b2(wb->qs, kqs + 1);
+                const float wd = __half2float(wb->d);
+#pragma unroll
+                for (int token = 0; token < tokens_per_wave; ++token) {
+                    int sumi = ggml_cuda_dp4a(w0, a0[token], 0);
+                    sumi = ggml_cuda_dp4a(w1, a1[token], sumi);
+                    tmp[token][row] += wd*ad[token]*float(sumi);
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int token = 0; token < tokens_per_wave; ++token) {
+#pragma unroll
+        for (int row = 0; row < rows_per_block; ++row) {
+            tmp[token][row] = warp_reduce_sum<warp_size>(tmp[token][row]);
+        }
+        if (lane < rows_per_block && uint32_t(row0 + lane) < nrows_x) {
+            dst[
+                sample_dst*stride_sample_dst +
+                channel_dst*stride_channel_dst +
+                (token0 + token)*stride_col_dst +
+                row0 +
+                lane] = tmp[token][lane];
+        }
+    }
+}
+
+// gfx1151 standard-Q8 N=1 K-split row-pair experiment.
+//
+// Two waves compute two output rows while splitting K between them. This keeps
+// the same total wave count as stock MMVQ (M waves), but each Q8_1 activation
+// block is consumed once for the row pair instead of once per row. Each wave
+// first reduces its two row partials to scalars; only four floats cross LDS.
+// The barrier cost is intended to be amortized by long-K decode matrices.
+template <bool scalar_exchange>
+__launch_bounds__(2*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q8_0_rdna35_k2r2(
+        const void * __restrict__ vx,
+        const void * __restrict__ vy,
+        float * __restrict__ dst,
+        const uint32_t ncols_x,
+        const uint32_t nrows_x,
+        const uint32_t stride_row_x,
+        const uint32_t stride_col_y,
+        const uint32_t stride_col_dst,
+        const uint3 channel_ratio,
+        const uint32_t stride_channel_x,
+        const uint32_t stride_channel_y,
+        const uint32_t stride_channel_dst,
+        const uint3 sample_ratio,
+        const uint32_t stride_sample_x,
+        const uint32_t stride_sample_y,
+        const uint32_t stride_sample_dst) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int qk = QK8_0;
+    constexpr int qi = QI8_0;
+    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
+    constexpr int rows_per_block = 2;
+    constexpr int nwarps = 2;
+    constexpr int blocks_per_wave_iter = vdr*warp_size/qi;
+
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int row0 = rows_per_block*blockIdx.x;
+    const int blocks_per_row_x = ncols_x/qk;
+    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t sample_dst = blockIdx.z;
+    const uint32_t channel_x = fastdiv(channel_dst, channel_ratio);
+    const uint32_t channel_y = channel_dst;
+    const uint32_t sample_x = fastdiv(sample_dst, sample_ratio);
+    const uint32_t sample_y = sample_dst;
+
+    const block_q8_1 * y =
+        (const block_q8_1 *) vy +
+        sample_y*stride_sample_y +
+        channel_y*stride_channel_y;
+    const int kbx_offset =
+        sample_x*stride_sample_x +
+        channel_x*stride_channel_x +
+        row0*stride_row_x;
+
+    float tmp[rows_per_block] = {0.0f};
+
+    for (int kbx =
+            warp*blocks_per_wave_iter + lane/(qi/vdr);
+            kbx < blocks_per_row_x;
+            kbx += nwarps*blocks_per_wave_iter) {
+        const int kqs = vdr*(lane % (qi/vdr));
+        const block_q8_1 * ab = y + kbx;
+        const int a0 = get_int_b4(ab->qs, kqs + 0);
+        const int a1 = get_int_b4(ab->qs, kqs + 1);
+        const float ad = __half2float(__low2half(ab->ds));
+
+#pragma unroll
+        for (int row = 0; row < rows_per_block; ++row) {
+            const int safe_row = min(row0 + row, int(nrows_x) - 1);
+            const block_q8_0 * wb =
+                (const block_q8_0 *) vx +
+                kbx_offset +
+                (safe_row - row0)*stride_row_x +
+                kbx;
+            const int w0 = get_int_b2(wb->qs, kqs + 0);
+            const int w1 = get_int_b2(wb->qs, kqs + 1);
+            int sumi = ggml_cuda_dp4a(w0, a0, 0);
+            sumi = ggml_cuda_dp4a(w1, a1, sumi);
+            tmp[row] += __half2float(wb->d)*ad*float(sumi);
+        }
+    }
+
+    if constexpr (scalar_exchange) {
+#pragma unroll
+        for (int row = 0; row < rows_per_block; ++row) {
+            tmp[row] = warp_reduce_sum<warp_size>(tmp[row]);
+        }
+
+        __shared__ float partial[nwarps][rows_per_block];
+        if (lane == 0) {
+#pragma unroll
+            for (int row = 0; row < rows_per_block; ++row) {
+                partial[warp][row] = tmp[row];
+            }
+        }
+
+        __syncthreads();
+
+        if (warp == 0 && lane < rows_per_block &&
+                uint32_t(row0 + lane) < nrows_x) {
+            dst[
+                sample_dst*stride_sample_dst +
+                channel_dst*stride_channel_dst +
+                row0 +
+                lane] =
+                partial[0][lane] + partial[1][lane];
+        }
+    } else {
+        // Warp 1 exports its unreduced lane partials. Warp 0 combines them
+        // with its registers and performs the same two reductions as stock.
+        __shared__ float partial[rows_per_block][warp_size];
+        if (warp == 1) {
+#pragma unroll
+            for (int row = 0; row < rows_per_block; ++row) {
+                partial[row][lane] = tmp[row];
+            }
+        }
+
+        __syncthreads();
+
+        if (warp == 0) {
+#pragma unroll
+            for (int row = 0; row < rows_per_block; ++row) {
+                tmp[row] += partial[row][lane];
+                tmp[row] = warp_reduce_sum<warp_size>(tmp[row]);
+            }
+
+            if (lane < rows_per_block &&
+                    uint32_t(row0 + lane) < nrows_x) {
+                dst[
+                    sample_dst*stride_sample_dst +
+                    channel_dst*stride_channel_dst +
+                    row0 +
+                    lane] = tmp[lane];
+            }
+        }
+    }
+
+    GGML_UNUSED(stride_col_y);
+    GGML_UNUSED(stride_col_dst);
+}
+
 // Dedicated MoE multi-token kernel.
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
@@ -926,6 +1247,89 @@ static std::pair<dim3, dim3> calc_launch_params(
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
     return {block_nums, block_dims};
+}
+
+static int gfx1151_q8_0_2d_mode(const int cc) {
+#if defined(GGML_USE_HIP)
+    static const char * value = std::getenv("GGML_ROCM_GFX1151_Q8_0_2D");
+    static const int mode =
+        value == nullptr ? 0 :
+        (std::strcmp(value, "1") == 0 || std::strcmp(value, "T2R2") == 0) ? 1 :
+        (std::strcmp(value, "2") == 0 || std::strcmp(value, "T4R2") == 0) ? 2 :
+        (std::strcmp(value, "3") == 0 || std::strcmp(value, "T2R4") == 0) ? 3 :
+        (std::strcmp(value, "4") == 0 || std::strcmp(value, "T1R2") == 0) ? 4 :
+        (std::strcmp(value, "5") == 0 || std::strcmp(value, "T1R4") == 0) ? 5 :
+        (std::strcmp(value, "6") == 0 || std::strcmp(value, "T1R8") == 0) ? 6 :
+        (std::strcmp(value, "7") == 0 || std::strcmp(value, "auto") == 0) ? 7 :
+        (std::strcmp(value, "8") == 0 || std::strcmp(value, "K2R2") == 0) ? 8 :
+        (std::strcmp(value, "9") == 0 || std::strcmp(value, "K2R2_LANE") == 0) ? 9 :
+        0;
+    return cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 ? mode : 0;
+#else
+    GGML_UNUSED(cc);
+    return 0;
+#endif
+}
+
+struct q8_0_2d_launch_args {
+    const void * vx;
+    const void * vy;
+    float * dst;
+    int ncols_x;
+    int nrows_x;
+    int nchannels_dst;
+    int nsamples_dst;
+    int stride_row_x;
+    int stride_col_y;
+    int stride_col_dst;
+    uint3 channel_ratio;
+    int stride_channel_x;
+    int stride_channel_y;
+    int stride_channel_dst;
+    uint3 sample_ratio;
+    int stride_sample_x;
+    int stride_sample_y;
+    int stride_sample_dst;
+    int warp_size;
+};
+
+template <bool scalar_exchange>
+static void launch_gfx1151_q8_0_k2r2(
+        const q8_0_2d_launch_args & args,
+        cudaStream_t stream) {
+    const dim3 block_nums(
+        (args.nrows_x + 1)/2,
+        args.nchannels_dst,
+        args.nsamples_dst);
+    const dim3 block_dims(args.warp_size, 2, 1);
+    mul_mat_vec_q8_0_rdna35_k2r2<scalar_exchange><<<block_nums, block_dims, 0, stream>>>(
+        args.vx, args.vy, args.dst,
+        args.ncols_x, args.nrows_x,
+        args.stride_row_x, args.stride_col_y, args.stride_col_dst,
+        args.channel_ratio,
+        args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+        args.sample_ratio,
+        args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst);
+}
+
+template <int ncols_dst, int tokens_per_wave, int rows_per_block>
+static void launch_gfx1151_q8_0_2d(
+        const q8_0_2d_launch_args & args,
+        cudaStream_t stream) {
+    const dim3 block_nums(
+        (args.nrows_x + rows_per_block - 1)/rows_per_block,
+        args.nchannels_dst,
+        args.nsamples_dst);
+    const dim3 block_dims(args.warp_size, ncols_dst/tokens_per_wave, 1);
+    mul_mat_vec_q8_0_rdna35_2d<ncols_dst, tokens_per_wave, rows_per_block>
+        <<<block_nums, block_dims, 0, stream>>>(
+            args.vx, args.vy, args.dst,
+            args.ncols_x, args.nrows_x,
+            args.stride_row_x, args.stride_col_y, args.stride_col_dst,
+            args.channel_ratio,
+            args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+            args.sample_ratio,
+            args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst);
 }
 
 template<ggml_type type, int c_ncols_dst, bool small_k = false>
@@ -1053,6 +1457,109 @@ static void mul_mat_vec_q_switch_ncols_dst(
             stride_channel_x, stride_channel_y, stride_channel_dst,
             ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
         return;
+    }
+
+    if constexpr (type == GGML_TYPE_Q8_0) {
+        if (!has_ids && !has_fusion) {
+            const int mode = gfx1151_q8_0_2d_mode(cc);
+            int selected_mode = mode;
+
+            if (mode == 7) {
+                // Evidence-gated gfx1151 lookup. These four M x K cells were
+                // measured independently against stock MMVQ; all other shapes
+                // deliberately retain the upstream kernel until characterized.
+                const bool measured_m =
+                    nrows_x == 4096 || nrows_x == 8192;
+                const bool measured_k =
+                    ncols_x == 2048 || ncols_x == 4096;
+
+                selected_mode = 0;
+                if (measured_m && measured_k) {
+                    if (ncols_dst == 1) {
+                        selected_mode = 4; // T1R2
+                    } else if (ncols_dst == 2) {
+                        selected_mode = 1; // T2R2
+                    } else if (ncols_dst == 4) {
+                        selected_mode =
+                            nrows_x == 8192 ? 3 : 2; // T2R4 or T4R2
+                    } else if (ncols_dst == 8 &&
+                            !(nrows_x == 8192 && ncols_x == 4096)) {
+                        selected_mode = 3; // T2R4
+                    }
+                }
+            }
+
+            const q8_0_2d_launch_args args = {
+                vx,
+                vy,
+                dst,
+                ncols_x,
+                nrows_x,
+                nchannels_dst,
+                nsamples_dst,
+                stride_row_x,
+                stride_col_y,
+                stride_col_dst,
+                channel_ratio_fd,
+                stride_channel_x,
+                stride_channel_y,
+                stride_channel_dst,
+                sample_ratio_fd,
+                stride_sample_x,
+                stride_sample_y,
+                stride_sample_dst,
+                warp_size,
+            };
+
+            if (ncols_dst == 1 && selected_mode == 4) {
+                launch_gfx1151_q8_0_2d<1, 1, 2>(args, stream);
+                return;
+            }
+            if (ncols_dst == 1 && selected_mode == 5) {
+                launch_gfx1151_q8_0_2d<1, 1, 4>(args, stream);
+                return;
+            }
+            if (ncols_dst == 1 && selected_mode == 6) {
+                launch_gfx1151_q8_0_2d<1, 1, 8>(args, stream);
+                return;
+            }
+            if (ncols_dst == 1 && selected_mode == 8) {
+                launch_gfx1151_q8_0_k2r2<true>(args, stream);
+                return;
+            }
+            if (ncols_dst == 1 && selected_mode == 9) {
+                launch_gfx1151_q8_0_k2r2<false>(args, stream);
+                return;
+            }
+            if (ncols_dst == 2 && selected_mode == 1) {
+                launch_gfx1151_q8_0_2d<2, 2, 2>(args, stream);
+                return;
+            }
+            if (ncols_dst == 2 && selected_mode == 3) {
+                launch_gfx1151_q8_0_2d<2, 2, 4>(args, stream);
+                return;
+            }
+            if (ncols_dst == 4 && selected_mode == 1) {
+                launch_gfx1151_q8_0_2d<4, 2, 2>(args, stream);
+                return;
+            }
+            if (ncols_dst == 4 && selected_mode == 2) {
+                launch_gfx1151_q8_0_2d<4, 4, 2>(args, stream);
+                return;
+            }
+            if (ncols_dst == 4 && selected_mode == 3) {
+                launch_gfx1151_q8_0_2d<4, 2, 4>(args, stream);
+                return;
+            }
+            if (ncols_dst == 8 && selected_mode == 2) {
+                launch_gfx1151_q8_0_2d<8, 4, 2>(args, stream);
+                return;
+            }
+            if (ncols_dst == 8 && selected_mode == 3) {
+                launch_gfx1151_q8_0_2d<8, 2, 4>(args, stream);
+                return;
+            }
+        }
     }
 
     switch (ncols_dst) {
@@ -1219,6 +1726,12 @@ static void mul_mat_vec_q_switch_type(
             break;
         case GGML_TYPE_Q8_0_ROCMFPX:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q8_0_ROCMFPX>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_Q7_0_ROCMFPX:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q7_0_ROCMFPX>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);

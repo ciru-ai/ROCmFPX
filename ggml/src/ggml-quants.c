@@ -236,6 +236,10 @@ void quantize_row_q5_1_ref(const float * GGML_RESTRICT x, block_q5_1 * GGML_REST
 void quantize_row_q8_0_ref(const float * GGML_RESTRICT x, block_q8_0 * GGML_RESTRICT y, int64_t k) {
     assert(k % QK8_0 == 0);
     const int nb = k / QK8_0;
+    const char * safe_search_env = getenv("GGML_Q8_0_SAFE_SCALE_SEARCH");
+    const bool safe_search = safe_search_env != NULL &&
+        safe_search_env[0] != '\0' &&
+        strcmp(safe_search_env, "0") != 0;
 
     for (int i = 0; i < nb; i++) {
         float amax = 0.0f; // absolute max
@@ -254,6 +258,78 @@ void quantize_row_q8_0_ref(const float * GGML_RESTRICT x, block_q8_0 * GGML_REST
             const float x0 = x[i*QK8_0 + j]*id;
 
             y[i].qs[j] = roundf(x0);
+        }
+
+        if (!safe_search || amax == 0.0f || !isfinite(amax)) {
+            continue;
+        }
+
+        // Offline-only Q8_0 scale search.  Each accepted candidate has lower
+        // block SSE without increasing that block's maximum absolute error.
+        // The wire format and all inference kernels remain ordinary Q8_0.
+        const float baseline_scale = GGML_FP16_TO_FP32(y[i].d);
+        double best_sse = 0.0;
+        double baseline_max_error = 0.0;
+        for (int j = 0; j < QK8_0; ++j) {
+            const double error = (double) x[i*QK8_0 + j] -
+                (double) baseline_scale * y[i].qs[j];
+            best_sse += error * error;
+            baseline_max_error = MAX(baseline_max_error, fabs(error));
+        }
+
+        float signed_amax = 0.0f;
+        for (int j = 0; j < QK8_0; ++j) {
+            const float value = x[i*QK8_0 + j];
+            if (fabsf(value) > fabsf(signed_amax)) {
+                signed_amax = value;
+            }
+        }
+
+        for (int denominator = 96; denominator <= 136; denominator += 2) {
+            float scale = -signed_amax / denominator;
+            ggml_fp16_t stored_scale = GGML_FP32_TO_FP16(scale);
+            int8_t codes[QK8_0] = { 0 };
+
+            for (int iteration = 0; iteration < 3; ++iteration) {
+                const float inverse_scale = scale != 0.0f ? 1.0f/scale : 0.0f;
+                double numerator = 0.0;
+                double denominator2 = 0.0;
+                for (int j = 0; j < QK8_0; ++j) {
+                    int code = (int) roundf(x[i*QK8_0 + j] * inverse_scale);
+                    code = MAX(-128, MIN(127, code));
+                    codes[j] = (int8_t) code;
+                    numerator += (double) x[i*QK8_0 + j] * code;
+                    denominator2 += (double) code * code;
+                }
+                if (!(denominator2 > 0.0)) {
+                    scale = 0.0f;
+                    break;
+                }
+                stored_scale = GGML_FP32_TO_FP16(
+                    (float) (numerator / denominator2));
+                scale = GGML_FP16_TO_FP32(stored_scale);
+                if (scale == 0.0f || !isfinite(scale)) {
+                    break;
+                }
+            }
+            if (scale == 0.0f || !isfinite(scale)) {
+                continue;
+            }
+
+            double candidate_sse = 0.0;
+            double candidate_max_error = 0.0;
+            for (int j = 0; j < QK8_0; ++j) {
+                const double error = (double) x[i*QK8_0 + j] -
+                    (double) scale * codes[j];
+                candidate_sse += error * error;
+                candidate_max_error = MAX(candidate_max_error, fabs(error));
+            }
+            if (candidate_sse < best_sse &&
+                    candidate_max_error <= baseline_max_error) {
+                best_sse = candidate_sse;
+                y[i].d = stored_scale;
+                memcpy(y[i].qs, codes, QK8_0);
+            }
         }
     }
 }
@@ -5735,6 +5811,13 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 if (!rocmfpx_validate_row_data_fp8(data, nbytes)) {
                     fprintf(stderr, "%s: invalid ROCmFPx FP8 row data\n", __func__);
+                    return false;
+                }
+            } break;
+        case GGML_TYPE_Q7_0_ROCMFPX:
+            {
+                if (!rocmfpx_validate_row_data_fp7(data, nbytes)) {
+                    fprintf(stderr, "%s: invalid ROCmFPx Q7-DOT32 row data\n", __func__);
                     return false;
                 }
             } break;

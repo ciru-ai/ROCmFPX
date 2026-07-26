@@ -171,6 +171,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_STRIX_LEAN  = 116, // ROCmFPx 6-bit protected Strix Halo lean recipe
         LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_STRIX_SPEED = 117, // ROCmFPx 6-bit attention-protected Strix Halo speed recipe
         LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_STRIX_QUALITY = 118, // ROCmFPx 6-bit Strix Halo quality recipe
+        LLAMA_FTYPE_MOSTLY_Q7_0_ROCMFPX          = 119, // ROCmFPx pure 7-bit gfx1151 INT8-dot layout
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };

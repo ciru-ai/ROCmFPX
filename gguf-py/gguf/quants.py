@@ -462,6 +462,23 @@ class Q6_0_ROCMFPX(__Quant, qtype=GGMLQuantizationType.Q6_0_ROCMFPX):
         return (vals * scales).reshape(n_blocks, cls.block_size)
 
 
+class Q7_0_ROCMFPX(__Quant, qtype=GGMLQuantizationType.Q7_0_ROCMFPX):
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        qs, d = np.hsplit(blocks, [224])
+
+        codes = _rocmfpx_unpack_codes(qs, 7, cls.block_size)
+        vals = codes.astype(np.int16)
+        vals = np.where((codes & np.uint8(64)) != 0, vals - 128, vals).astype(np.float32)
+
+        scales = d.view(np.float16).astype(np.float32).reshape(n_blocks, 8, 1)
+        vals = vals.reshape(n_blocks, 8, cls.block_size // 8)
+
+        return (vals * scales).reshape(n_blocks, cls.block_size)
+
+
 class Q8_0_ROCMFPX(__Quant, qtype=GGMLQuantizationType.Q8_0_ROCMFPX):
     @classmethod
     def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:

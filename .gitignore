@@ -148,6 +148,7 @@ flake.lock
 /run-chat.sh
 /run-spec.sh
 /.ccache/
+/.rocprofv3/
 
 # IDE
 

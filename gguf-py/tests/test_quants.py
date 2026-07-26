@@ -32,6 +32,7 @@ c_float_p = ctypes.POINTER(ctypes.c_float)
 DEQUANTIZE_ROW_SYMBOLS = {
     GGMLQuantizationType.Q3_0_ROCMFPX: "rocmfpx_dequantize_row_fp3",
     GGMLQuantizationType.Q6_0_ROCMFPX: "rocmfpx_dequantize_row_fp6",
+    GGMLQuantizationType.Q7_0_ROCMFPX: "rocmfpx_dequantize_row_fp7",
     GGMLQuantizationType.Q8_0_ROCMFPX: "rocmfpx_dequantize_row_fp8",
 }
 
@@ -91,6 +92,7 @@ class GGMLQuants:
             GGMLQuantizationType.MXFP4, GGMLQuantizationType.NVFP4,
             GGMLQuantizationType.Q3_0_ROCMFPX,
             GGMLQuantizationType.Q6_0_ROCMFPX,
+            GGMLQuantizationType.Q7_0_ROCMFPX,
             GGMLQuantizationType.Q8_0_ROCMFPX,
             GGMLQuantizationType.IQ2_XXS, GGMLQuantizationType.IQ2_XS,
             GGMLQuantizationType.IQ2_S, GGMLQuantizationType.IQ3_XXS,
