@@ -1,20 +1,88 @@
 # ROCmFPX for llama.cpp
 
-Experimental AMD-focused ROCmFP3, ROCmFP4, ROCmFP6, and ROCmFP8 quantization
-formats for `llama.cpp`.
+Experimental AMD-focused ROCmFP3, ROCmFP4, ROCmFP6, ROCmFP7, and ROCmFP8
+quantization formats for `llama.cpp`.
 
 This repository is for people who want to download, compile, quantize, and test
 the ROCmFPX family directly from:
 
 ```text
-https://github.com/charlie12345/ROCmFPX/tree/experimental-rocmfpx-branch
+https://github.com/ciru-ai/ROCmFPX
 ```
 
-The same source is intended to live on `main` so GitHub shows the ROCmFPX
-instructions by default.
+The reproducible first DualView release lives on the `dualview` branch. It is
+frozen near the runtime used for the published Ornith measurements while the
+forward-port to newer ROCmFPX/llama.cpp revisions is validated separately.
 
 > Status: experimental research build. Results are hardware-, driver-, model-,
 > and prompt-sensitive. Use BF16/F16 sources for real quality tests.
+
+## DualView: Q7 decode, Q8 prefill, one model
+
+DualView is a new execution architecture for local LLM inference. A model keeps
+compact signed Q7 codes as its source of truth, then exposes those exact integer
+values to the GPU in two different physical forms:
+
+- **Decode:** packed `Q7_0_ROCMFPX`, reducing the bytes read for every generated
+  token.
+- **Prefill:** an exact signed-Q8 compute view, opening the native INT8
+  dot-product and WMMA path for wide prompt processing.
+
+The Q7-to-Q8 view change is lossless with respect to the stored Q7 code: it
+sign-extends the integer and reuses the same scale. It does not claim that Q7
+itself is lossless relative to BF16.
+
+The first public model is
+**Ornith1.0-35B-CIRU-DUALVIEW-FPX7+Q8-MTP**. Its retained quality-max target
+measured **1,236.156 tok/s at PP4096** on a Radeon 8060S / `gfx1151`, ahead of
+both the original Q7S8 recipe and the official Q8_0 control under the matched
+full-model protocol.
+
+- [Learn DualView visually](https://llm.ciru.ai/dualview)
+- [Architecture, build, and run guide](docs/DUALVIEW.md)
+- [Complete Ornith 35B research record](docs/DUALVIEW-ORNITH-35B-RESEARCH.md)
+
+### Fastest validated install path: Ubuntu + Strix Halo
+
+Install a current ROCm Core SDK first, then:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake git ninja-build pkg-config \
+  libcurl4-openssl-dev
+
+git clone --branch dualview --single-branch \
+  https://github.com/ciru-ai/ROCmFPX.git
+cd ROCmFPX
+JOBS="$(nproc)" ./scripts/build-strix-dualview.sh
+```
+
+Run the integrated Ornith target with its official Q8 MTP head:
+
+```bash
+export GGML_ROCM_GFX1151_Q7_Q8_VIEW=no-output
+# Recommended for large UMA loads:
+export GGML_HIP_ENABLE_UNIFIED_MEMORY=1
+# Only for an older ROCm stack that does not identify the APU as gfx1151:
+# export HSA_OVERRIDE_GFX_VERSION=11.5.1
+
+./build-strix-dualview/bin/llama-server \
+  -m /path/to/Ornith1.0-35b-CIRU-DUALVIEW-FPX7+Q8-MTP.gguf \
+  -a Ornith1.0-35b-CIRU-DUALVIEW-FPX7+Q8-MTP \
+  --host 127.0.0.1 --port 8080 --jinja \
+  --reasoning on --reasoning-format deepseek --reasoning-budget -1 \
+  -dev ROCm0 -sm none -ngl 999 -fa on \
+  -n 16384 -c 131072 -b 2048 -ub 512 -t 16 -tb 16 \
+  -ctk f16 -ctv f16 --parallel 1 --metrics --mmap --no-repack \
+  --no-cache-prompt --no-context-shift -fit off \
+  --spec-type draft-mtp --spec-draft-p-min 0.50 \
+  --spec-draft-n-max 7 -ctkd f16 -ctvd f16
+```
+
+For short prompts, depth 6 was the stronger general mean. For 16K–64K prompts,
+depth 7 was the retained decode profile. For prompt-heavy requests with short
+answers, disable MTP (`--spec-type none`) so speculative-prefill overhead does
+not dominate wall time.
 
 ## What Is ROCmFPX?
 
@@ -25,6 +93,7 @@ ROCmFPX is a family of GGUF model-weight quants:
 | ROCmFP3 | `Q3_0_ROCMFPX` | smallest experimental ROCmFPX weight format |
 | ROCmFP4 | `Q4_0_ROCMFP4`, `Q4_0_ROCMFP4_FAST` | promoted 4-bit ROCm family baseline |
 | ROCmFP6 | `Q6_0_ROCMFPX` | middle quality/size ROCmFPX weight format |
+| ROCmFP7 | `Q7_0_ROCMFPX` | 7.50 bpw signed-code format and DualView source |
 | ROCmFP8 | `Q8_0_ROCMFPX` | high-quality ROCmFPX reference format |
 
 Agent-specific versions are also available:
@@ -81,14 +150,14 @@ FFN-gate tensors.
 ## Clone And Build
 
 ```bash
-git clone https://github.com/charlie12345/ROCmFPX.git
+git clone https://github.com/ciru-ai/ROCmFPX.git
 cd ROCmFPX
 ```
 
-If you specifically want the experimental branch name:
+For the tested DualView runtime:
 
 ```bash
-git checkout experimental-rocmfpx-branch
+git checkout dualview
 ```
 
 Pick the build script for your machine:
