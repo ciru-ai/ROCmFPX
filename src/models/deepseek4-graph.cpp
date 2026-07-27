@@ -1397,6 +1397,11 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         cb(mix.pre, "hc_ffn_pre_weights", il);
         cb(mix.post, "hc_ffn_pre_post_weights", il);
         cb(mix.comb, "hc_ffn_pre_comb", il);
+
+        ggml_build_forward_expand(gf, residual);
+        ggml_build_forward_expand(gf, mix.post);
+        ggml_build_forward_expand(gf, mix.comb);
+
         cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
         ggml_tensor * selected = nullptr;
@@ -1435,6 +1440,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         cb(cur, "ffn_out", il);
         inpL = dsv4_hc_post(ctx0, cur, residual, mix.post, mix.comb, n_embd, n_hc, n_tokens);
         cb(inpL, "hc_ffn_post", il);
+        cb(inpL, "l_last", il);
     }
     if (cparams.embeddings_pre_norm) {
         res->t_h_pre_norm = inpL;
