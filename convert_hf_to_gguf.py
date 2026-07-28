@@ -112,6 +112,11 @@ class ModelBase:
     disable_mistral_community_chat_template: bool = False
     sentence_transformers_dense_modules: bool = False
 
+    # MTP export modes; architectures with filtering support opt in.
+    supports_mtp_export: bool = False
+    mtp_only: bool = False
+    no_mtp: bool = False
+
     def __init__(self, dir_model: Path, ftype: gguf.LlamaFileType, fname_out: Path, *, is_big_endian: bool = False,
                  use_temp_file: bool = False, eager: bool = False,
                  metadata_override: Path | None = None, model_name: str | None = None,
@@ -121,7 +126,8 @@ class ModelBase:
                  sentence_transformers_dense_modules: bool = False,
                  target_model_dir: Path | None = None,
                  fuse_gate_up_exps: bool = False,
-                 fp8_as_q8: bool = False):
+                 fp8_as_q8: bool = False,
+                 **_unused_kwargs):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
@@ -5580,6 +5586,8 @@ class _Qwen35MtpMixin:
     `mtp.*` to the standard layer-indexed nextn naming so the existing
     tensor_map handles them."""
 
+    supports_mtp_export = True
+
     # Class-level annotations so the type checker understands the attributes
     # available on the concrete subclasses in the MRO
     hparams: dict[str, Any]
@@ -5590,11 +5598,13 @@ class _Qwen35MtpMixin:
 
     mtp_only: bool = False
     no_mtp: bool = False
+    _has_mtp_tensors: bool
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._has_mtp_tensors = any(name.startswith("mtp.") for name in self.model_tensors)
         self.block_count = self.hparams["num_hidden_layers"]
-        if not self.no_mtp:
+        if not self.no_mtp and self._has_mtp_tensors:
             self.block_count += self.hparams.get("mtp_num_hidden_layers", 0)
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
 
@@ -5619,7 +5629,7 @@ class _Qwen35MtpMixin:
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()  # ty: ignore[unresolved-attribute]
-        if self.no_mtp:
+        if self.no_mtp or not self._has_mtp_tensors:
             return
         if (n := self.hparams.get("mtp_num_hidden_layers", 0)) > 0:
             self.gguf_writer.add_nextn_predict_layers(n)
@@ -5671,6 +5681,67 @@ class Qwen3_5TextModel(_Qwen35MtpMixin, _Qwen35MRopeMixin, _LinearAttentionVReor
 @ModelBase.register("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM")
 class Qwen3_5MoeTextModel(_Qwen35MtpMixin, _Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35MOE
+
+
+@ModelBase.register("DFlashDraftModel")
+class DFlashModel(Qwen3Model):
+    model_arch = gguf.MODEL_ARCH.DFLASH
+
+    def set_vocab(self):
+        if self.target_model_dir is None:
+            raise ValueError(
+                "DFlash draft model requires --target-model-dir to be specified. "
+                "Please provide the path to the target model directory containing the tokenizer."
+            )
+        logger.info(f"DFlash: Using tokenizer from target model: {self.target_model_dir}")
+        original_dir = self.dir_model
+        self.dir_model = self.target_model_dir
+        super().set_vocab()
+        self.dir_model = original_dir
+
+        mask_token_id = self.hparams.get("dflash_config", {}).get("mask_token_id")
+        if mask_token_id is not None:
+            self.gguf_writer.add_mask_token_id(mask_token_id)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        block_size = self.hparams.get("block_size", 16)
+        self.gguf_writer.add_block_size(block_size)
+        dflash_config = self.hparams.get("dflash_config", {})
+
+        target_layer_ids = dflash_config.get("target_layer_ids", [])
+        if target_layer_ids:
+            extract_layer_ids = [i + 1 for i in target_layer_ids]
+            self.gguf_writer.add_target_layers(extract_layer_ids)
+
+        # Emit the target model's hidden size so the loader sizes the encoder fc input as
+        # n_target_layers * target_hidden_size instead of assuming it equals the draft n_embd.
+        # Harmless when they already match; corrects the fc width when the draft is narrower.
+        if self.target_model_dir is not None:
+            try:
+                target_hparams = ModelBase.load_hparams(self.target_model_dir, self.is_mistral_format)
+                target_hidden = target_hparams.get("hidden_size", target_hparams.get("n_embd"))
+                if target_hidden:
+                    self.gguf_writer.add_target_hidden_size(int(target_hidden))
+                    logger.info(f"DFlash: target_hidden_size = {int(target_hidden)}")
+            except Exception as e:
+                logger.warning(f"DFlash: could not read target hidden size ({e}); loader will fall back to draft n_embd")
+
+        use_sliding_window = self.hparams.get("use_sliding_window", False)
+        sliding_window = self.hparams.get("sliding_window")
+        layer_types = self.hparams.get("layer_types")
+        if use_sliding_window and sliding_window and layer_types:
+            is_swa = [lt == "sliding_attention" for lt in layer_types]
+            self.gguf_writer.add_sliding_window(sliding_window)
+            self.gguf_writer.add_sliding_window_pattern(is_swa)
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+        if not name.startswith("model."):
+            name = "model." + name
+        return super().filter_tensors((name, gen))
 
 
 # MiniCPM-V 4.6: text tower is Qwen3.5 (linear+full hybrid attention) wrapped under
@@ -9948,6 +10019,7 @@ class MiMoV2VisionModel(MmprojModel):
 @ModelBase.register("Step3p5ForCausalLM")
 class Step35Model(TextModel):
     model_arch = gguf.MODEL_ARCH.STEP35
+    supports_mtp_export = True
 
     def set_gguf_parameters(self):
         rope_theta = self.hparams.get("rope_theta")
@@ -12419,6 +12491,22 @@ class HunYuanMoEModel(TextModel):
 @ModelBase.register("HYV3ForCausalLM")
 class HYV3Model(TextModel):
     model_arch = gguf.MODEL_ARCH.HYV3
+    supports_mtp_export = True
+
+    # Trunk layer count, stashed before indexing so filter_tensors can
+    # distinguish the appended MTP block from the main decoder.
+    _n_main_layers: int | None = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        n_nextn = int(self.hparams.get("num_nextn_predict_layers", 0))
+        if n_nextn > 0 and not self.no_mtp:
+            self.block_count += n_nextn
+            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    def index_tensors(self, remote_hf_model_id: str | None = None):
+        type(self)._n_main_layers = int(self.hparams["num_hidden_layers"])
+        return super().index_tensors(remote_hf_model_id=remote_hf_model_id)
 
     def set_vocab(self):
         self._set_vocab_gpt2()
@@ -12432,14 +12520,36 @@ class HYV3Model(TextModel):
         self.gguf_writer.add_expert_weights_norm(self.hparams.get("route_norm", True))
         self.gguf_writer.add_expert_weights_scale(float(self.hparams.get("router_scaling_factor", 1.0)))
         self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
+        n_nextn = int(self.hparams.get("num_nextn_predict_layers", 0))
+        if n_nextn > 0 and not self.no_mtp:
+            self.gguf_writer.add_nextn_predict_layers(n_nextn)
         logger.info("gguf: HYV3 sigmoid router with correction bias")
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        if (titem := super().filter_tensors(item)) is None:
+            return None
+        name, gen = titem
+
+        assert cls._n_main_layers is not None
+        match = re.match(r"model\.layers\.(\d+)\.", name)
+        is_mtp = match is not None and int(match.group(1)) >= cls._n_main_layers
+
+        if is_mtp and cls.no_mtp:
+            return None
+        if cls.mtp_only and not is_mtp and name not in (
+            "model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
+        ):
+            return None
+
+        if is_mtp:
+            name = name.replace(".final_layernorm.", ".shared_head.norm.")
+
+        return name, gen
 
     _experts: list[dict[str, Tensor]] | None = None
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        if name.startswith("model.layers.") and bid is not None and bid >= self.block_count:
-            return
-
         if name.startswith("model.layers.") and ".mlp.experts." in name:
             n_experts = self.find_hparam(["num_local_experts", "num_experts"])
             assert bid is not None
@@ -14427,9 +14537,10 @@ def main() -> None:
             logger.error("--mtp and --no-mtp are mutually exclusive")
             sys.exit(1)
 
-        if (args.mtp or args.no_mtp) and not issubclass(model_class, (_Qwen35MtpMixin, Step35Model)):
-            logger.error("--mtp / --no-mtp are only supported for Qwen3.5/3.6 and Step3.5 text variants today")
-            sys.exit(1)
+        if args.mtp or args.no_mtp:
+            if not model_class.supports_mtp_export:
+                logger.error("--mtp / --no-mtp are not supported for %s", model_architecture)
+                sys.exit(1)
 
         # set on the class so __init__ / filter_tensors see the correct mode
         if args.no_mtp:
@@ -14437,34 +14548,21 @@ def main() -> None:
         if args.mtp:
             model_class.mtp_only = True  # ty: ignore[unresolved-attribute]
 
-        model_kwargs = {
-            "is_big_endian": args.bigendian,
-            "use_temp_file": args.use_temp_file,
-            "eager": args.no_lazy,
-            "metadata_override": args.metadata,
-            "model_name": args.model_name,
-            "split_max_tensors": args.split_max_tensors,
-            "split_max_size": split_str_to_n_bytes(args.split_max_size),
-            "dry_run": args.dry_run,
-            "small_first_shard": args.no_tensor_first_split,
-            "remote_hf_model_id": hf_repo_id,
-            "disable_mistral_community_chat_template": disable_mistral_community_chat_template,
-            "sentence_transformers_dense_modules": args.sentence_transformers_dense_modules,
-            "target_model_dir": Path(args.target_model_dir) if args.target_model_dir else None,
-            "fuse_gate_up_exps": args.fuse_gate_up_exps,
-            "fp8_as_q8": args.fp8_as_q8,
-        }
-        supports_deepseek4_options = (
-            getattr(model_class, "model_arch", None) == getattr(gguf.MODEL_ARCH, "DEEPSEEK4", None)
-        )
-        if (args.deepseek4_max_layers is not None or args.deepseek4_include_mtp) and not supports_deepseek4_options:
-            logger.error("--deepseek4-max-layers / --deepseek4-include-mtp are only supported for DeepSeek V4")
-            sys.exit(1)
-        if supports_deepseek4_options:
-            model_kwargs["deepseek4_max_layers"] = args.deepseek4_max_layers
-            model_kwargs["deepseek4_include_mtp"] = args.deepseek4_include_mtp
-
-        model_instance = model_class(dir_model, output_type, fname_out, **model_kwargs)
+        model_instance = model_class(dir_model, output_type, fname_out,
+                                     is_big_endian=args.bigendian, use_temp_file=args.use_temp_file,
+                                     eager=args.no_lazy,
+                                     metadata_override=args.metadata, model_name=args.model_name,
+                                     split_max_tensors=args.split_max_tensors,
+                                     split_max_size=split_str_to_n_bytes(args.split_max_size), dry_run=args.dry_run,
+                                     small_first_shard=args.no_tensor_first_split,
+                                     remote_hf_model_id=hf_repo_id, disable_mistral_community_chat_template=disable_mistral_community_chat_template,
+                                     sentence_transformers_dense_modules=args.sentence_transformers_dense_modules,
+                                     target_model_dir=Path(args.target_model_dir) if args.target_model_dir else None,
+                                     fuse_gate_up_exps=args.fuse_gate_up_exps,
+                                     fp8_as_q8=args.fp8_as_q8,
+                                     deepseek4_max_layers=args.deepseek4_max_layers,
+                                     deepseek4_include_mtp=args.deepseek4_include_mtp,
+                                     )
 
         if args.vocab_only:
             logger.info("Exporting model vocab...")

@@ -891,7 +891,9 @@ void ggml_vec_dot_turbo3_0(int n, float * GGML_RESTRICT s, size_t bs,
     const block_turbo3_0 *x = (const block_turbo3_0 *)vx;
     const float *y = (const float *)vy;
 
-    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by);
+    GGML_ASSERT(n % TURBO_HEAD_DIM == 0);
+    GGML_ASSERT(nrc == 1);
 
     // Dequantize x into temp buffer (includes inverse FWHT + norm scaling),
     // then compute dot product with y.
@@ -930,7 +932,9 @@ void ggml_vec_dot_turbo4_0(int n, float * GGML_RESTRICT s, size_t bs,
     const block_turbo4_0 *x = (const block_turbo4_0 *)vx;
     const float *y = (const float *)vy;
 
-    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by);
+    GGML_ASSERT(n % TURBO_HEAD_DIM == 0);
+    GGML_ASSERT(nrc == 1);
 
     // Dequantize x into temp buffer (includes inverse FWHT + norm scaling),
     // then compute dot product with y.
@@ -5797,6 +5801,13 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 if (!rocmfpx_validate_row_data_fp3(data, nbytes)) {
                     fprintf(stderr, "%s: invalid ROCmFPx FP3 row data\n", __func__);
+                    return false;
+                }
+            } break;
+        case GGML_TYPE_Q2_0_ROCMFPX:
+            {
+                if (!rocmfpx_validate_row_data_fp2(data, nbytes)) {
+                    fprintf(stderr, "%s: invalid ROCmFPx FP2 row data\n", __func__);
                     return false;
                 }
             } break;

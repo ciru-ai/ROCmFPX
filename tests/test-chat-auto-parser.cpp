@@ -58,6 +58,20 @@ static void test_nemotron_analysis(testing & t);
 static void test_nemotron_reasoning_detection(testing & t);
 static void test_nemotron_tool_format(testing & t);
 
+// Laguna template analysis tests
+static void test_laguna_analysis(testing & t);
+static void test_laguna_reasoning_detection(testing & t);
+static void test_laguna_tool_format(testing & t);
+static void test_laguna_s_analysis(testing & t);
+static void test_laguna_s_reasoning_detection(testing & t);
+static void test_laguna_s_tool_format(testing & t);
+static void test_laguna_xs2_analysis(testing & t);
+static void test_laguna_xs2_reasoning_detection(testing & t);
+static void test_laguna_xs2_tool_format(testing & t);
+
+// HY3 template analysis tests
+static void test_hy3_tool_analysis(testing & t);
+
 // CohereForAI template analysis tests
 static void test_cohere_reasoning_detection(testing & t);
 static void test_cohere_analysis(testing & t);
@@ -99,6 +113,10 @@ int main(int argc, char * argv[]) {
     t.test("seed_oss_diffs", test_seed_oss_tool_analysis);
     t.test("cohere", test_cohere_analysis);
     t.test("nemotron", test_nemotron_analysis);
+    t.test("hy3", test_hy3_tool_analysis);
+    t.test("laguna", test_laguna_analysis);
+    t.test("laguna-s", test_laguna_s_analysis);
+    t.test("laguna-xs2", test_laguna_xs2_analysis);
     t.test("smollm3", test_smollm3_analysis);
     t.test("standard_json_tools", test_standard_json_tools_formats);
     t.test("normalize_quotes_to_json", test_normalize_quotes_to_json);
@@ -1293,6 +1311,64 @@ static common_chat_template load_template(testing & t, const std::string & templ
     return tmpl;
 }
 
+static void test_hy3_tool_analysis(testing & t) {
+    common_chat_template tmpl = load_template(t, "models/templates/tencent-Hy3.jinja");
+
+    struct autoparser analysis;
+    analysis.analyze_template(tmpl);
+
+    t.assert_equal("tool mode should be tagged arguments", tool_format::TAG_WITH_TAGGED, analysis.tools.format.mode);
+    t.assert_equal("tool section start", "<tool_calls:opensource>\n", analysis.tools.format.section_start);
+    t.assert_equal("tool section end", "</tool_calls:opensource>", analysis.tools.format.section_end);
+    t.assert_equal("per-call end should be empty", "", analysis.tools.format.per_call_end);
+    t.assert_equal("function argument separator", "<tool_sep:opensource>", analysis.tools.function.args_separator);
+    t.assert_true("separator should be preserved", std::find(
+            analysis.preserved_tokens.begin(), analysis.preserved_tokens.end(),
+            "<tool_sep:opensource>") != analysis.preserved_tokens.end());
+    t.assert_true("HY3 EOS should not be preserved", std::find(
+            analysis.preserved_tokens.begin(), analysis.preserved_tokens.end(),
+            "<｜hy_eos:opensource｜>") == analysis.preserved_tokens.end());
+
+    ::autoparser::generation_params inputs;
+    inputs.tools            = build_tools_definition();
+    inputs.tool_choice      = COMMON_CHAT_TOOL_CHOICE_AUTO;
+    inputs.reasoning_format = COMMON_REASONING_FORMAT_NONE;
+
+    auto parser = analysis.build_parser(inputs);
+    std::string output =
+        "<tool_calls:opensource>\n"
+        "<tool_call:opensource>test_function_name<tool_sep:opensource>\n"
+        "<arg_key:opensource>param1</arg_key:opensource>\n"
+        "<arg_value:opensource>first</arg_value:opensource>\n"
+        "<arg_key:opensource>param2</arg_key:opensource>\n"
+        "<arg_value:opensource>first-extra</arg_value:opensource>\n"
+        "</tool_call:opensource>\n"
+        "<tool_call:opensource>test_function_name<tool_sep:opensource>\n"
+        "<arg_key:opensource>param1</arg_key:opensource>\n"
+        "<arg_value:opensource>second</arg_value:opensource>\n"
+        "<arg_key:opensource>param2</arg_key:opensource>\n"
+        "<arg_value:opensource>second-extra</arg_value:opensource>\n"
+        "</tool_call:opensource>\n"
+        "</tool_calls:opensource>";
+
+    common_peg_parse_context ctx(output);
+    auto result = parser.parse(ctx);
+    if (!t.assert_true("parallel HY3 tool calls should parse", result.success())) {
+        return;
+    }
+
+    common_chat_msg msg;
+    auto mapper = common_chat_peg_mapper(msg);
+    mapper.from_ast(ctx.ast, result);
+    t.assert_equal("parallel HY3 tool call count", 2u, msg.tool_calls.size());
+    if (msg.tool_calls.size() == 2) {
+        t.assert_equal("first HY3 tool name", "test_function_name", msg.tool_calls[0].name);
+        t.assert_equal("second HY3 tool name", "test_function_name", msg.tool_calls[1].name);
+        t.assert_equal("first HY3 argument", "first", json::parse(msg.tool_calls[0].arguments).value("param1", ""));
+        t.assert_equal("second HY3 argument", "second", json::parse(msg.tool_calls[1].arguments).value("param1", ""));
+    }
+}
+
 // ============================================================================
 // Nemotron Template Analysis Tests
 // ============================================================================
@@ -1366,13 +1442,101 @@ static void test_nemotron_tool_format(testing & t) {
     // Check argument markers (note: markers retain trailing newlines for proper parsing)
     t.assert_equal("arg_name_prefix should be '<parameter='", "<parameter=", analysis.tools.arguments.name_prefix);
     t.assert_equal("arg_name_suffix should be '>\\n'", ">\n", analysis.tools.arguments.name_suffix);
-    t.assert_equal("arg_value_suffix should be '</parameter>\\n'", "</parameter>\n", analysis.tools.arguments.value_suffix);
+    t.assert_equal("arg_value_suffix should be '\\n</parameter>\\n'", "\n</parameter>\n", analysis.tools.arguments.value_suffix);
 
     // Check format classification
     t.assert_true("tool format should be TAG_WITH_TAGGED", analysis.tools.format.mode == tool_format::TAG_WITH_TAGGED);
 
     // Verify tool support
     t.assert_true("should support tools", analysis.jinja_caps.supports_tools);
+}
+
+// ============================================================================
+// Laguna Template Analysis Tests
+// ============================================================================
+static common_chat_template load_laguna_template(testing & t) {
+    return load_template(t, "models/templates/poolside-Laguna-XS-2.1.jinja");
+}
+
+static void test_laguna_reasoning_detection(testing & t) {
+    common_chat_template tmpl = load_laguna_template(t);
+    struct autoparser analysis;
+    analysis.analyze_template(tmpl);
+    // Laguna's template renders reasoning delimiters with formatting whitespace
+    // ("<think>\n") that the model does not emit; the Laguna patch trims them.
+    t.assert_equal("reasoning_start should be '<think>'", "<think>", analysis.reasoning.start);
+    t.assert_equal("reasoning_end should be '</think>'", "</think>", analysis.reasoning.end);
+    t.assert_equal("reasoning should be TAG_BASED", reasoning_mode::TAG_BASED, analysis.reasoning.mode);
+}
+
+static void test_laguna_tool_format(testing & t) {
+    common_chat_template tmpl = load_laguna_template(t);
+    struct autoparser analysis;
+    analysis.analyze_template(tmpl);
+    t.assert_equal("arg_value_suffix should be '</arg_value>'", "</arg_value>", analysis.tools.arguments.value_suffix);
+}
+
+static void test_laguna_stop_string(testing & t) {
+    // The </assistant> turn terminator can be emitted as ordinary text tokens
+    // (not the single eot token), so it must also be a literal stop string.
+    common_chat_template tmpl = load_laguna_template(t);
+    struct autoparser analysis;
+    analysis.analyze_template(tmpl);
+    bool has_stop = false;
+    for (const auto & stop : analysis.additional_stops) {
+        if (stop == "</assistant>") { has_stop = true; break; }
+    }
+    t.assert_true("Laguna additional_stops contains </assistant>", has_stop);
+}
+
+static void test_laguna_analysis(testing & t) {
+    t.test("Laguna reasoning detection", test_laguna_reasoning_detection);
+    t.test("Laguna tool format", test_laguna_tool_format);
+    t.test("Laguna stop string", test_laguna_stop_string);
+}
+
+static common_chat_template load_laguna_s_template(testing & t) {
+    return load_template(t, "models/templates/poolside-Laguna-S-2.1.jinja");
+}
+static void test_laguna_s_reasoning_detection(testing & t) {
+    common_chat_template tmpl = load_laguna_s_template(t);
+    struct autoparser analysis;
+    analysis.analyze_template(tmpl);
+    t.assert_equal("Laguna-S(v8) reasoning_start should be '<think>'", "<think>", analysis.reasoning.start);
+    t.assert_equal("Laguna-S(v8) reasoning_end should be '</think>'", "</think>", analysis.reasoning.end);
+    t.assert_equal("Laguna-S(v8) reasoning should be TAG_BASED", reasoning_mode::TAG_BASED, analysis.reasoning.mode);
+}
+static void test_laguna_s_tool_format(testing & t) {
+    common_chat_template tmpl = load_laguna_s_template(t);
+    struct autoparser analysis;
+    analysis.analyze_template(tmpl);
+    t.assert_equal("Laguna-S(v8) arg_value_suffix should be '</arg_value>'", "</arg_value>", analysis.tools.arguments.value_suffix);
+}
+static void test_laguna_s_analysis(testing & t) {
+    t.test("Laguna-S(v8) reasoning detection", test_laguna_s_reasoning_detection);
+    t.test("Laguna-S(v8) tool format", test_laguna_s_tool_format);
+}
+
+static common_chat_template load_laguna_xs2_template(testing & t) {
+    return load_template(t, "models/templates/poolside-Laguna-XS.2.jinja");
+}
+static void test_laguna_xs2_reasoning_detection(testing & t) {
+    common_chat_template tmpl = load_laguna_xs2_template(t);
+    struct autoparser analysis;
+    analysis.analyze_template(tmpl);
+    t.assert_equal("Laguna-XS.2(v5) reasoning_start should be '<think>'", "<think>", analysis.reasoning.start);
+    t.assert_equal("Laguna-XS.2(v5) reasoning_end should be '</think>'", "</think>", analysis.reasoning.end);
+    t.assert_equal("Laguna-XS.2(v5) reasoning should be TAG_BASED", reasoning_mode::TAG_BASED, analysis.reasoning.mode);
+}
+static void test_laguna_xs2_tool_format(testing & t) {
+    common_chat_template tmpl = load_laguna_xs2_template(t);
+    struct autoparser analysis;
+    analysis.analyze_template(tmpl);
+    t.assert_equal("Laguna-XS.2(v5) arg_value_suffix should be '</arg_value>'", "</arg_value>", analysis.tools.arguments.value_suffix);
+}
+static void test_laguna_xs2_analysis(testing & t) {
+    t.test("Laguna-XS.2(v5) reasoning detection", test_laguna_xs2_reasoning_detection);
+    t.test("Laguna-XS.2(v5) tool format", test_laguna_xs2_tool_format);
 }
 
 static common_chat_template load_cohere_template(testing & t) {
@@ -1905,12 +2069,11 @@ static void test_tagged_args_with_embedded_quotes(testing & t) {
         return p.content(p.until("<seed:tool_call>")) + p.optional(tool_section) + p.end();
     });
 
-    // The exact input from the failing test
     std::string input =
         "<seed:tool_call>\n"
         "<function=edit>\n"
-        "<parameter=filename>\n"
-        "foo.cpp\n"
+        "<parameter=filename>"
+        "foo.cpp"
         "</parameter>\n"
         "<parameter=oldString>"
         "def foo(arg = \"14\"):\n"
@@ -1966,4 +2129,3 @@ static void test_tagged_args_with_embedded_quotes(testing & t) {
         }
     }
 }
-

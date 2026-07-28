@@ -211,15 +211,8 @@ int32_t fa_rocmfpx_fp6_pack4_regs(uint qs0, uint qs1, uint qs2, uint qs3, uint q
         fa_kvalues_rocmfpx_fp6_const[fa_rocmfpx_fp6_code_at(qs0, qs1, qs2, qs3, qs4, qs5, b0 + 18u)]));
 }
 
-int32_t fa_rocmfpx_fp6_pack4_qs(const uint8_t qs[24], uint ei) {
-    return fa_rocmfpx_fp6_pack4_regs(
-        pack32(u8vec4(qs[0], qs[1], qs[2], qs[3])),
-        pack32(u8vec4(qs[4], qs[5], qs[6], qs[7])),
-        pack32(u8vec4(qs[8], qs[9], qs[10], qs[11])),
-        pack32(u8vec4(qs[12], qs[13], qs[14], qs[15])),
-        pack32(u8vec4(qs[16], qs[17], qs[18], qs[19])),
-        pack32(u8vec4(qs[20], qs[21], qs[22], qs[23])),
-        ei);
+int32_t fa_rocmfpx_fp6_pack4_qs(const int8_t qs[32], uint ei) {
+    return pack32(i8vec4(qs[ei + 0u], qs[ei + 1u], qs[ei + 2u], qs[ei + 3u]));
 }
 
 #if defined(FA_ROCMFPX_FAMILY)

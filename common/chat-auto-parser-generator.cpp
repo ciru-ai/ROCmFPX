@@ -46,6 +46,9 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
     data.prompt           = common_chat_template_direct_apply(tmpl, inputs);
     data.format           = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.preserved_tokens = autoparser.preserved_tokens;
+    data.additional_stops.insert(data.additional_stops.end(),
+                                 autoparser.additional_stops.begin(),
+                                 autoparser.additional_stops.end());
 
     auto parser = autoparser.build_parser(inputs);
     data.parser = parser.save();
@@ -116,7 +119,7 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs) cons
             auto response_format = p.rule("response-format", p.content(p.schema(p.json(), "response-format-schema", inputs.json_schema)));
             parser = ctx.reasoning_parser + p.space() + p.choice({
                 p.literal("```json") + p.space() + response_format + p.space() + p.literal("```"),
-                response_format
+                p.space() + response_format  + p.space()
             }) + p.end();
             pure_content = false;
         } else if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE && jinja_caps.supports_tool_calls) {
@@ -239,6 +242,10 @@ common_peg_parser analyze_tools::build_func_parser(common_chat_peg_builder & p, 
     bool              matched_atomic = false;
     common_peg_parser func_parser    = p.eps();
 
+    if (!function.args_separator.empty()) {
+        open = open + p.space() + p.literal(function.args_separator);
+    }
+
     if (!function.name_suffix.empty()) {
         func_parser    = open + call_id_section + p.space() + args;
         matched_atomic = true;
@@ -259,7 +266,13 @@ common_peg_parser analyze_tools::build_func_parser(common_chat_peg_builder & p, 
         // we only emit tool_close when we can actually see the closing marker. This prevents
         // premature closing during partial parsing when we've seen e.g. "</" which could be
         // either "</tool_call>" (end) or "<arg_key>" prefix that failed to match.
-        func_parser = func_parser + p.tool_close(p.peek(p.literal(format.per_call_end)));
+        // Laguna (v4): the model may emit whitespace between the last </arg_value> and
+        // </tool_call> even though the template renders them tight. Tolerate optional
+        // leading space in the close lookahead so the tool call still closes.
+        auto close_peek = arguments.tolerate_intertag_whitespace
+                              ? p.peek(p.space() + p.literal(format.per_call_end))
+                              : p.peek(p.literal(format.per_call_end));
+        func_parser = func_parser + p.tool_close(close_peek);
     } else {
         func_parser = func_parser + p.tool_close(p.space());  // force this to process tool closing callbacks in mapper
     }
@@ -375,8 +388,7 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
                            (schema_info.resolves_to_string(param_schema) ?
                                 p.tool_arg_string_value(until_suffix) :
                                 p.tool_arg_json_value(p.schema(
-                                    p.json(), "tool-" + name + "-arg-" + param_name + "-schema", param_schema, false)) +
-                                    p.space()) +
+                                    p.json(), "tool-" + name + "-arg-" + param_name + "-schema", param_schema, false))) +
                            p.tool_arg_close(p.literal(arguments.value_suffix)));
 
             auto named_arg = p.rule("tool-" + name + "-arg-" + param_name, arg);

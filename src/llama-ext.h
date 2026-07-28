@@ -9,6 +9,14 @@
 #include <cstdint>
 #include <map>
 
+// Process a batch of tokens while temporarily limiting the physical
+// micro-batch size for this call. A value of 0 uses the context default.
+// The logical decode remains a single call and retains all output rows.
+LLAMA_API int32_t llama_decode_with_ubatch(
+        struct llama_context * ctx,
+          struct llama_batch   batch,
+                   uint32_t     n_ubatch);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,
@@ -105,6 +113,10 @@ LLAMA_API int32_t llama_model_n_embd_pre_norm(const struct llama_model * model);
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
+
+// Select the speculative NextN step used to validate reusable MTP graph inputs.
+// This is process-thread state rather than context state and defaults to zero.
+LLAMA_API void llama_set_mtp_speculative_step(int32_t step);
 
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);

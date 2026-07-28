@@ -31,6 +31,26 @@
 #include <unordered_map>
 #include <vector>
 
+#ifndef GGML_ROCMFP6_EXPANDED_DEVICE
+#define GGML_ROCMFP6_EXPANDED_DEVICE 0
+#endif
+
+// Optional device-only ROCmFP6 layout. GGUF/CPU storage remains the packed
+// block_rocmfp6 layout; experimental ROCm builds may expand qs to signed
+// bytes to avoid bit unpacking in hot matmul/FA kernels.
+struct block_rocmfp6_expanded {
+    int8_t  qs[QK_ROCMFP6];
+    uint8_t e[2];
+};
+
+static_assert(sizeof(block_rocmfp6_expanded) == QK_ROCMFP6 + 2*sizeof(uint8_t), "wrong expanded rocmfp6 block size/padding");
+
+#if GGML_ROCMFP6_EXPANDED_DEVICE
+using block_rocmfp6_device = block_rocmfp6_expanded;
+#else
+using block_rocmfp6_device = block_rocmfp6;
+#endif
+
 #if defined(GGML_USE_HIP)
 #include "vendors/hip.h"
 #elif defined(GGML_USE_MUSA)
@@ -1030,6 +1050,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q3_0_ROCMFPX> {
     static constexpr int qk = QK_ROCMFP3;
     static constexpr int qr = QR_ROCMFP3;
     static constexpr int qi = QI_ROCMFP3;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q2_0_ROCMFPX> {
+    static constexpr int qk = QK_ROCMFP2;
+    static constexpr int qr = QR_ROCMFP2;
+    static constexpr int qi = QI_ROCMFP2;
 };
 
 template<>
