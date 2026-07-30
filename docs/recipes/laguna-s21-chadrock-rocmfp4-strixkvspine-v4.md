@@ -53,6 +53,38 @@ Validation on Ryzen AI Max+ 395 / Radeon 8060S with Mesa RADV 26.1.2:
 | 64K, one full prefill | 267.27 tok/s | 35.63 tok/s | Pass |
 | 128K, one full prefill | 195.70 tok/s | 35.62 tok/s | Pass |
 
+### Mesa 25.3.x / kernel 6.19.x revision note
+
+The Mesa 26.1.2 row above assumes a kernel+Vulkan stack that has shipped several
+upstream ring-stall fixes for gfx1151. Earlier stacks (Mesa 25.3.x with
+`linux-firmware` < 20251201, kernel 6.19.x without the 6.19.12 device-lost
+backport, etc.) still trip the 2-second `amdgpu` `lockup_timeout` watchdog on
+the 100 k+ V2 lane because the FA split is purely in-command-buffer and does not
+emit progress fences between the dispatched workgroups. The conservative safe
+defaults for these earlier stacks are:
+
+| Setting | Mesa 26.1.2 | Mesa 25.3.x |
+| --- | --- | --- |
+| `GGML_VK_MAX_NODES_PER_SUBMIT` | 10 | 4 |
+| `GGML_VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH` | 4 | 1 |
+
+Verification on Ryzen AI Max+ 395 / Radeon 8060S with Mesa RADV 25.3.6 /
+kernel 6.19.12-200.fc43, N=4 fresh-server 103k prefill runs:
+
+| Run | http | time | ptok/s | kernel ring timeout |
+| --- | ---: | ---: | ---: | --- |
+| 1 | 200 | 565s | 185.87 | none |
+| 2 | 200 | 569s | 186.15 | none |
+| 3 | 200 | 572s | 185.37 | none |
+| 4 | 200 | 568s | 185.40 | none |
+
+By contrast, the unhardened Mesa-26.1.2 defaults (10/4) on the same stack fail
+deterministically: 1/2 observed `Compute error` after 463 s, with kernel
+`comp_1.X.Y timeout` followed by `device wedged, but recovered through reset`.
+The 4/1 split lowers the per-submission work below the 2-second watchdog
+ceiling without altering generation correctness — match-on-string sampling
+matches the Mesa-26.1.2 128K reference output.
+
 The 8K V2 row improved prompt processing by 10.57% over the matched unsplit
 10-node control (318.70 tok/s), with effectively unchanged generation speed.
 Deterministic split and unsplit test generations were byte-identical after
