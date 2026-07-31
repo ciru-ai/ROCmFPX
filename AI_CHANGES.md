@@ -228,3 +228,37 @@ the conservative (4/1) split with fresh-server restarts.
 | Fresh-server 103k prefill, N=4 with V2 defaults 4/1 | 4/4 PASS at 565-572 s, ~185-186 tok/s, zero `amdgpu ring comp_* timeout`, zero `device wedged`, server healthy after each run |
 | Reproducibility of unhardened 10/4 on Mesa 25.3.x | confirmed 1/2 observed Compute error at ~463 s; earlier N=5 testing at the pre-V2 ubatch=4096 + q8_0 config gave 5/5 device-lost |
 
+## Session 004 — 2026-07-31
+
+**Scope:** Survey Laguna model variants and serving stacks at 100k context;
+identify the fastest path for "between steps after 80-90k cached context";
+follow-up to Session 003 with the q4_0 KV validation and the prefix-cache
+behavior discovered during the survey.
+
+### `scripts/run-laguna-s21-rocmfp4-v4.sh`
+
+| Fix | Line(s) | Detail |
+|-----|---------|--------|
+| Accept `q4_0` in KV cache validators | 86, 94 | `case "$CACHE_TYPE_K"` / `case "$CACHE_TYPE_V"` now match `f16\|q8_0\|q4_0`. The error messages were updated to match. q4_0 was the unsupported option surfaced by the survey. |
+
+### `docs/recipes/laguna-s21-chadrock-rocmfp4-strixkvspine-v4.md`
+
+| Fix | Detail |
+|-----|--------|
+| KV cache quantization and prefix caching section | New subsection after the 8K V2 baseline. Includes the per-`Cache type` decode-speed table (q4_0 ≈ 4% faster decode vs q8_0 at 92k cached), the prefix-cache verification table (cold 426 s vs cache-hit <1 s on the same 92k prefix), and an explicit guard against `--no-cache-idle-slots` / `--cache-prompt off` (the previous 256k lane had `--no-cache-idle-slots` set, which is the regression to fix). |
+
+### Validation
+
+| Check | Result |
+|-------|--------|
+| q4_0 KV cache at 92k ctx, 92k prefill, project Vulkan + ROCmFP4 v4 | 217 tok/s prefill, 23.7 tok/s cold decode, <1 s on cache-hit follow-up |
+| q8_0 KV cache at 92k ctx, 92k prefill (Session 003 baseline) | 211 tok/s prefill, 22.8 tok/s cold decode |
+| Q4_K_M model at 92k ctx, 92k prefill (`laguna-s-2.1-Q4_K_M.gguf`) | 190 tok/s prefill, 17.2 tok/s decode — slower than the ROCmFP4 v4 artifact |
+| Stock llama.cpp Vulkan + Q4_K_M | fails: `error loading model architecture: unknown model architecture: 'laguna'` |
+| Stock llama.cpp Vulkan + ROCmFP4 v4 | fails: `tensor 'blk.0.attn_output.weight' has invalid ggml type 101` |
+| ROCm 7.2 runtime at `/home/llmbox/rocmfpx-runtime/llama-server` | fails: missing `liborigami.so.1` |
+| Cache-hit follow-up (same 92k prefix, second request) | 92,452 of 92,453 tokens served from cached slot, prefill 55 ms, total <1 s |
+| `parallel=2` aggregate | prefill doubles to 367 tok/s aggregate, decode serializes at the GPU memory bandwidth; net loss for single-stream workflows |
+| `ctx=65536` (60k cached) | 260 tok/s prefill, 25.4 tok/s decode — slightly faster than 92k |
+| `ctx=40960` (32k cached) | 320 tok/s prefill, 29.3 tok/s decode — ~30% faster decode than 92k cached |
+

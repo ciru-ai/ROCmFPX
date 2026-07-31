@@ -83,17 +83,17 @@ case "$SPLIT_MODE" in
 esac
 
 case "$CACHE_TYPE_K" in
-    f16|q8_0) ;;
+    f16|q8_0|q4_0) ;;
     *)
-        echo "CACHE_TYPE_K must be f16 or q8_0, got: $CACHE_TYPE_K" >&2
+        echo "CACHE_TYPE_K must be f16, q8_0, or q4_0, got: $CACHE_TYPE_K" >&2
         exit 2
         ;;
 esac
 
 case "$CACHE_TYPE_V" in
-    f16|q8_0) ;;
+    f16|q8_0|q4_0) ;;
     *)
-        echo "CACHE_TYPE_V must be f16 or q8_0, got: $CACHE_TYPE_V" >&2
+        echo "CACHE_TYPE_V must be f16, q8_0, or q4_0, got: $CACHE_TYPE_V" >&2
         exit 2
         ;;
 esac

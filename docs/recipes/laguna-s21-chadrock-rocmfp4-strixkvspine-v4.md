@@ -90,6 +90,37 @@ The 8K V2 row improved prompt processing by 10.57% over the matched unsplit
 Deterministic split and unsplit test generations were byte-identical after
 removing their timing lines.
 
+### KV cache quantization and prefix caching
+
+The runtime exposes `CACHE_TYPE_K` and `CACHE_TYPE_V` to choose the KV cache
+quantization. The default is `q8_0` on both K and V. Choices validated on the
+Ryzen AI Max+ 395 / Radeon 8060S with Mesa 25.3.6 / kernel 6.19.x:
+
+| Cache type | Per-token decode at 92k cached (cold) | Notes |
+| --- | ---: | --- |
+| `f16` | not measured on this Mesa | 2× VRAM, no benefit on this stack |
+| `q8_0` | 22.8 tok/s | safe default |
+| `q4_0` | 23.7 tok/s | ~4% faster decode, small quality hit |
+
+The launch script accepts `CACHE_TYPE_K=q4_0 CACHE_TYPE_V=q4_0` to opt in.
+Set either independently — mixed types are also valid.
+
+The default llama-server prompt cache is enabled (`--cache-prompt`,
+`--cache-idle-slots`). When a request's `messages` array shares a prefix with
+the cached slot, the matched tokens are reused from the slot's KV cache and
+only the delta (the new user turn + chat template) is pre-filled. Verified on
+the runtime build at 92k cached:
+
+| Phase | Cold request | Prefix-matched follow-up |
+| --- | --- | --- |
+| Prefill | 92,453 tokens in 425 s (217 tok/s) | 1 token in 55 ms (cache_n = 92,452) |
+| Decode | 11 tokens in 467 ms (23.5 tok/s) | 11 tokens in 445 ms (24 tok/s) |
+| Total | 426 s | <1 s |
+
+The between-step latency drops ~430× on the workflow where the same long
+document is re-sent with a small follow-up. Do **not** add `--no-cache-idle-slots`
+or `--cache-prompt off` to the runtime — that disables the fast path.
+
 ## Supported release target
 
 - AMD Ryzen AI Max+ 395 / Radeon 8060S Strix Halo
