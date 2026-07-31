@@ -53,10 +53,108 @@ Validation on Ryzen AI Max+ 395 / Radeon 8060S with Mesa RADV 26.1.2:
 | 64K, one full prefill | 267.27 tok/s | 35.63 tok/s | Pass |
 | 128K, one full prefill | 195.70 tok/s | 35.62 tok/s | Pass |
 
+### Mesa 25.3.x / kernel 6.19.x revision note
+
+The Mesa 26.1.2 row above assumes a kernel+Vulkan stack that has shipped several
+upstream ring-stall fixes for gfx1151. Earlier stacks (Mesa 25.3.x with
+`linux-firmware` < 20251201, kernel 6.19.x without the 6.19.12 device-lost
+backport, etc.) still trip the 2-second `amdgpu` `lockup_timeout` watchdog on
+the 100 k+ V2 lane because the FA split is purely in-command-buffer and does not
+emit progress fences between the dispatched workgroups. The conservative safe
+defaults for these earlier stacks are:
+
+| Setting | Mesa 26.1.2 | Mesa 25.3.x |
+| --- | --- | --- |
+| `GGML_VK_MAX_NODES_PER_SUBMIT` | 10 | 4 |
+| `GGML_VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH` | 4 | 1 |
+
+Verification on Ryzen AI Max+ 395 / Radeon 8060S with Mesa RADV 25.3.6 /
+kernel 6.19.12-200.fc43, N=4 fresh-server 103k prefill runs:
+
+| Run | http | time | ptok/s | kernel ring timeout |
+| --- | ---: | ---: | ---: | --- |
+| 1 | 200 | 565s | 185.87 | none |
+| 2 | 200 | 569s | 186.15 | none |
+| 3 | 200 | 572s | 185.37 | none |
+| 4 | 200 | 568s | 185.40 | none |
+
+By contrast, the unhardened Mesa-26.1.2 defaults (10/4) on the same stack fail
+deterministically: 1/2 observed `Compute error` after 463 s, with kernel
+`comp_1.X.Y timeout` followed by `device wedged, but recovered through reset`.
+The 4/1 split lowers the per-submission work below the 2-second watchdog
+ceiling without altering generation correctness — match-on-string sampling
+matches the Mesa-26.1.2 128K reference output.
+
 The 8K V2 row improved prompt processing by 10.57% over the matched unsplit
 10-node control (318.70 tok/s), with effectively unchanged generation speed.
 Deterministic split and unsplit test generations were byte-identical after
 removing their timing lines.
+
+### KV cache quantization and prefix caching
+
+The runtime exposes `CACHE_TYPE_K` and `CACHE_TYPE_V` to choose the KV cache
+quantization. The default is `q8_0` on both K and V. Choices validated on the
+Ryzen AI Max+ 395 / Radeon 8060S with Mesa 25.3.6 / kernel 6.19.x:
+
+| Cache type | Per-token decode at 92k cached (cold) | Notes |
+| --- | ---: | --- |
+| `f16` | not measured on this Mesa | 2× VRAM, no benefit on this stack |
+| `q8_0` | 22.8 tok/s | safe default |
+| `q4_0` | 23.7 tok/s | ~4% faster decode, small quality hit |
+
+The launch script accepts `CACHE_TYPE_K=q4_0 CACHE_TYPE_V=q4_0` to opt in.
+Set either independently — mixed types are also valid.
+
+The default llama-server prompt cache is enabled (`--cache-prompt`,
+`--cache-idle-slots`). When a request's `messages` array shares a prefix with
+the cached slot, the matched tokens are reused from the slot's KV cache and
+only the delta (the new user turn + chat template) is pre-filled. Verified on
+the runtime build at 92k cached:
+
+| Phase | Cold request | Prefix-matched follow-up |
+| --- | --- | --- |
+| Prefill | 92,453 tokens in 425 s (217 tok/s) | 1 token in 55 ms (cache_n = 92,452) |
+| Decode | 11 tokens in 467 ms (23.5 tok/s) | 11 tokens in 445 ms (24 tok/s) |
+| Total | 426 s | <1 s |
+
+The between-step latency drops ~430× on the workflow where the same long
+document is re-sent with a small follow-up. Do **not** add `--no-cache-idle-slots`
+or `--cache-prompt off` to the runtime — that disables the fast path.
+
+#### Caveat: SWA invalidation on long generations
+
+The Laguna model is ISWA — 12 full-attention layers interleaved with 36
+sliding-window-attention (SWA) layers, `n_swa = 512`. The prompt cache only
+stores KV for the full-attention layers. The SWA layers' keys are anchored to
+the slot's live `pos_min`, so once a slot has generated past 512 tokens the
+prefix cache for that position is invalidated. After that, only the first
+~`n_swa` tokens of the matched prefix are re-usable; the rest is forced
+re-prefill. The server logs this as:
+
+```
+slot update_slots: id 0 | task N | n_past = 2920,
+    slot.prompt.tokens.size() = 61432, seq_id = 0, pos_min = 59896, n_swa = 512
+slot update_slots: id 0 | task N | forcing full prompt re-processing due to
+    lack of cache data (likely due to SWA or hybrid/recurrent memory,
+    see https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+```
+
+In practice, the 430× speedup is only realized on a fresh slot — the first
+request after server boot, or after the slot has been released between turns
+without any generation. Long generations that push past the SWA window
+discard the cache. Multi-turn "send the same document again" workflows
+should expect to re-prefill the full document on the second request onwards.
+
+Workarounds, none of which are currently promoted in the V2 safe lane:
+
+1. `--swa-full` disables SWA, making the entire model full-attention. The
+   cache would then be reusable, but: (a) doubles VRAM use, (b) breaks the
+   Mesa 25.3.x stability gate that the V2 lane was hardened against, (c)
+   pushes a 131k context window out of the 128 GiB unified memory budget.
+2. `--parallel N` splits the cache across slots, but does not help the
+   single-client "same prefix again" workflow.
+3. Persisting the slot between requests is not exposed via the HTTP API;
+   the slot is released on every response.
 
 ## Supported release target
 

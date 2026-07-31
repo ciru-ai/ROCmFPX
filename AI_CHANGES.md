@@ -193,3 +193,72 @@ byte 2: v2[5:4] | v3[5:0]<<2
 *(Repeat per file. Keep entries factual. Do not remove or rewrite earlier sessions.)*
 
 -->
+
+## Session 003 — 2026-07-30
+
+**Scope:** Harden the V2 safe lane against Mesa 25.3.x / kernel 6.19.x
+device-lost crashes observed during 100 k-token prefill. Reproduced
+deterministically on Mesa 25.3.6 / kernel 6.19.12-200.fc43 (5/5
+deterministic Compute error with the Mesa-26.1.2 defaults of
+`GGML_VK_MAX_NODES_PER_SUBMIT=10` /
+`GGML_VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH=4`). Confirmed 4/4 PASS at
+the conservative (4/1) split with fresh-server restarts.
+
+### `scripts/run-laguna-s21-rocmfp4-v4.sh`
+
+| Fix | Line(s) | Detail |
+|-----|---------|--------|
+| Safe split default | 28-29 | `VK_MAX_NODES_PER_SUBMIT=10 → 4` and `VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH=4 → 1` for `STABILITY_MODE=safe`. The Mesa-26.1.2 numbers are still accepted via the same env vars for users on that stack; new comment explains the divergence. |
+| CACHE_TYPE_K/V default | 21-22 | Added `f16` defaults for `CACHE_TYPE_K` and `CACHE_TYPE_V` env vars so the `safe` lane can be tuned without re-editing the script. |
+| CACHE_TYPE_K/V validation | 78-92 | New `case` validators reject anything outside `f16|q8_0` to match the recipe. |
+| `--cache-type-k/v` from vars | 136-137 | Hard-coded `f16` replaced with `$CACHE_TYPE_K` / `$CACHE_TYPE_V`. |
+| Banner line | 159 | Banner now prints the resolved `cache_type_k`/`cache_type_v`. |
+
+### `docs/recipes/laguna-s21-chadrock-rocmfp4-strixkvspine-v4.md`
+
+| Fix | Detail |
+|-----|--------|
+| Mesa 25.3.x revision note | New subsection under the V2 validation table explaining why the 4/1 split exists and showing the N=4 103k verification numbers (185-186 tok/s prefill, 0 ring timeouts, Mesa 25.3.6 / kernel 6.19.12-200.fc43). |
+| Mesa-26.1.2 ↔ Mesa-25.3.x default table | Small per-stack table next to the verification block so operators know which split to apply. |
+
+### Validation
+
+| Check | Result |
+|-------|--------|
+| Fresh-server 103k prefill, N=4 with V2 defaults 4/1 | 4/4 PASS at 565-572 s, ~185-186 tok/s, zero `amdgpu ring comp_* timeout`, zero `device wedged`, server healthy after each run |
+| Reproducibility of unhardened 10/4 on Mesa 25.3.x | confirmed 1/2 observed Compute error at ~463 s; earlier N=5 testing at the pre-V2 ubatch=4096 + q8_0 config gave 5/5 device-lost |
+
+## Session 004 — 2026-07-31
+
+**Scope:** Survey Laguna model variants and serving stacks at 100k context;
+identify the fastest path for "between steps after 80-90k cached context";
+follow-up to Session 003 with the q4_0 KV validation and the prefix-cache
+behavior discovered during the survey.
+
+### `scripts/run-laguna-s21-rocmfp4-v4.sh`
+
+| Fix | Line(s) | Detail |
+|-----|---------|--------|
+| Accept `q4_0` in KV cache validators | 86, 94 | `case "$CACHE_TYPE_K"` / `case "$CACHE_TYPE_V"` now match `f16\|q8_0\|q4_0`. The error messages were updated to match. q4_0 was the unsupported option surfaced by the survey. |
+
+### `docs/recipes/laguna-s21-chadrock-rocmfp4-strixkvspine-v4.md`
+
+| Fix | Detail |
+|-----|--------|
+| KV cache quantization and prefix caching section | New subsection after the 8K V2 baseline. Includes the per-`Cache type` decode-speed table (q4_0 ≈ 4% faster decode vs q8_0 at 92k cached), the prefix-cache verification table (cold 426 s vs cache-hit <1 s on the same 92k prefix), and an explicit guard against `--no-cache-idle-slots` / `--cache-prompt off` (the previous 256k lane had `--no-cache-idle-slots` set, which is the regression to fix). |
+
+### Validation
+
+| Check | Result |
+|-------|--------|
+| q4_0 KV cache at 92k ctx, 92k prefill, project Vulkan + ROCmFP4 v4 | 217 tok/s prefill, 23.7 tok/s cold decode, <1 s on cache-hit follow-up |
+| q8_0 KV cache at 92k ctx, 92k prefill (Session 003 baseline) | 211 tok/s prefill, 22.8 tok/s cold decode |
+| Q4_K_M model at 92k ctx, 92k prefill (`laguna-s-2.1-Q4_K_M.gguf`) | 190 tok/s prefill, 17.2 tok/s decode — slower than the ROCmFP4 v4 artifact |
+| Stock llama.cpp Vulkan + Q4_K_M | fails: `error loading model architecture: unknown model architecture: 'laguna'` |
+| Stock llama.cpp Vulkan + ROCmFP4 v4 | fails: `tensor 'blk.0.attn_output.weight' has invalid ggml type 101` |
+| ROCm 7.2 runtime at `/home/llmbox/rocmfpx-runtime/llama-server` | fails: missing `liborigami.so.1` |
+| Cache-hit follow-up (same 92k prefix, second request) | 92,452 of 92,453 tokens served from cached slot, prefill 55 ms, total <1 s |
+| `parallel=2` aggregate | prefill doubles to 367 tok/s aggregate, decode serializes at the GPU memory bandwidth; net loss for single-stream workflows |
+| `ctx=65536` (60k cached) | 260 tok/s prefill, 25.4 tok/s decode — slightly faster than 92k |
+| `ctx=40960` (32k cached) | 320 tok/s prefill, 29.3 tok/s decode — ~30% faster decode than 92k cached |
+
