@@ -121,6 +121,41 @@ The between-step latency drops ~430× on the workflow where the same long
 document is re-sent with a small follow-up. Do **not** add `--no-cache-idle-slots`
 or `--cache-prompt off` to the runtime — that disables the fast path.
 
+#### Caveat: SWA invalidation on long generations
+
+The Laguna model is ISWA — 12 full-attention layers interleaved with 36
+sliding-window-attention (SWA) layers, `n_swa = 512`. The prompt cache only
+stores KV for the full-attention layers. The SWA layers' keys are anchored to
+the slot's live `pos_min`, so once a slot has generated past 512 tokens the
+prefix cache for that position is invalidated. After that, only the first
+~`n_swa` tokens of the matched prefix are re-usable; the rest is forced
+re-prefill. The server logs this as:
+
+```
+slot update_slots: id 0 | task N | n_past = 2920,
+    slot.prompt.tokens.size() = 61432, seq_id = 0, pos_min = 59896, n_swa = 512
+slot update_slots: id 0 | task N | forcing full prompt re-processing due to
+    lack of cache data (likely due to SWA or hybrid/recurrent memory,
+    see https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+```
+
+In practice, the 430× speedup is only realized on a fresh slot — the first
+request after server boot, or after the slot has been released between turns
+without any generation. Long generations that push past the SWA window
+discard the cache. Multi-turn "send the same document again" workflows
+should expect to re-prefill the full document on the second request onwards.
+
+Workarounds, none of which are currently promoted in the V2 safe lane:
+
+1. `--swa-full` disables SWA, making the entire model full-attention. The
+   cache would then be reusable, but: (a) doubles VRAM use, (b) breaks the
+   Mesa 25.3.x stability gate that the V2 lane was hardened against, (c)
+   pushes a 131k context window out of the 128 GiB unified memory budget.
+2. `--parallel N` splits the cache across slots, but does not help the
+   single-client "same prefix again" workflow.
+3. Persisting the slot between requests is not exposed via the HTTP API;
+   the slot is released on every response.
+
 ## Supported release target
 
 - AMD Ryzen AI Max+ 395 / Radeon 8060S Strix Halo
