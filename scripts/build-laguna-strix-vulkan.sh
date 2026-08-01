@@ -55,6 +55,8 @@ cmake --build "$BUILD_DIR" -j "$JOBS" --target \
     llama-cli \
     llama-bench \
     llama-quantize \
+    test-json-schema-to-grammar \
+    test-chat \
     test-chat-auto-parser \
     test-llama-archs
 
@@ -67,3 +69,7 @@ echo "  $BUILD_DIR/bin/llama-server"
 echo "  $BUILD_DIR/bin/llama-cli"
 echo "  $BUILD_DIR/bin/llama-bench"
 echo "  $BUILD_DIR/bin/llama-quantize"
+echo "  $BUILD_DIR/bin/test-json-schema-to-grammar"
+echo "  $BUILD_DIR/bin/test-chat"
+echo "  $BUILD_DIR/bin/test-chat-auto-parser"
+echo "  $BUILD_DIR/bin/test-llama-archs"

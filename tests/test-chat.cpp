@@ -542,6 +542,38 @@ static common_chat_tool edit_tool{
     })",
 };
 
+static common_chat_tool pi_edit_tool{
+    /* .name = */ "edit",
+    /* .description = */ "Edit a file using exact text replacement",
+    /* .parameters = */ R"({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Path to the file to edit"
+            },
+            "edits": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "oldText": {
+                            "type": "string"
+                        },
+                        "newText": {
+                            "type": "string"
+                        }
+                    },
+                    "required": ["oldText", "newText"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["path", "edits"],
+        "additionalProperties": false
+    })",
+};
+
 static common_chat_tool manage_todo_list_tool{
     /* .name = */ "manage_todo_list",
     /* .description = */ "Create or update the todo list",
@@ -3599,6 +3631,25 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                 .expect_reconstruction()
                 .run();
         }
+    }
+
+    // Laguna S 2.1 uses tagged arguments. Exercise the exact Pi edit shape that
+    // exposed the JSON grammar/parser spacing mismatch: array<object> with
+    // source-code strings containing braces and escaped newlines.
+    {
+        auto tst = peg_tester("models/templates/poolside-Laguna-S-2.1.jinja", detailed_debug);
+        tst.test(
+               "<tool_call>edit"
+               "<arg_key>path</arg_key><arg_value>/tmp/foo.rs</arg_value>"
+               "<arg_key>edits</arg_key>"
+               R"(<arg_value>[{"oldText":"fn old() {\n}\n","newText":"fn new() {\n    println!(\"ok\");\n}\n"}]</arg_value>)"
+               "</tool_call>")
+            .enable_thinking(false)
+            .tools({ pi_edit_tool })
+            .expect_tool_calls({
+                { "edit", R"({"path":"/tmp/foo.rs","edits":[{"oldText":"fn old() {\n}\n","newText":"fn new() {\n    println!(\"ok\");\n}\n"}]})", {} },
+            })
+            .run();
     }
 
     // Verify the throw path produces a readable error message, not std::out_of_range.

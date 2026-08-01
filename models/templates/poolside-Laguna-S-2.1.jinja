@@ -41,7 +41,6 @@
   {%- if message.role == "user" -%}
     {{- "<user>" + content + "</user>\n" -}}
   {%- elif message.role == "assistant" -%}
-    {%- generation -%}
       {{- "<assistant>" -}}
       {#- Extract reasoning content from message.reasoning (vLLM field name) or message.reasoning_content -#}
       {%- set reasoning_content = '' -%}
@@ -73,7 +72,6 @@
         {%- endfor -%}
       {%- endif -%}
       {{- "</assistant>\n" -}}
-    {%- endgeneration -%}
   {%- elif message.role == "tool" -%}
     {{- "<tool_response>" + content + "</tool_response>\n" -}}
   {%- elif message.role == "system" -%}

@@ -1,6 +1,6 @@
-# Laguna S 2.1 Chadrock ROCmFP4 StrixKVSpine V4 — Runtime V2
+# Laguna S 2.1 Chadrock ROCmFP4 StrixKVSpine V4 — Runtime V3
 
-Runtime V2 and serving recipe for the Laguna S 2.1 118B-A8B ROCmFP4 artifact:
+Runtime V3 and serving recipe for the Laguna S 2.1 118B-A8B ROCmFP4 artifact:
 
 ```text
 laguna-s-2.1-ROCmFP4-StrixKVSpine-v4.gguf
@@ -10,11 +10,25 @@ SHA-256 ea1d854a72c47ec8e72c16ea91b8ff3cd5e1620b834df175f683c86f27dc26d6
 This model uses the `laguna` GGUF architecture and ROCmFP4 tensor types. Use
 this ROCmFPX branch rather than stock llama.cpp.
 
-The V2 update changes the Vulkan runtime and serving defaults. The GGUF weights
-are unchanged from the first release, so existing downloads do not need to be
-replaced.
+Runtime V3 adds tool-call grammar/parser and portable-template fixes on top of
+the V2 Vulkan runtime. The GGUF weights are unchanged, so existing downloads do
+not need to be replaced.
 
-## V2 patch notes
+## V3 patch notes
+
+Runtime V3:
+
+- ports llama.cpp PR #24835 so generated JSON values no longer carry trailing
+  grammar whitespace that the final PEG tool parser rejects;
+- aligns PEG JSON-array comma whitespace handling with the generated grammar;
+- adds a Laguna/Pi regression for an `edit` call containing an
+  `array<object>` argument and source-code strings;
+- removes the render-only `{% generation %}` extension from the Laguna S 2.1
+  template, preserving the rendered prompt while allowing standard Jinja and
+  MiniJinja engines such as Hipfire to parse it;
+- retains the V2 RADV DeviceLost safeguards and validated 128K defaults.
+
+## V2 Vulkan patch notes
 
 The first runtime release could lose the Vulkan device during a very deep
 Flash Attention prefill on RADV/Strix Halo. Reducing the graph-node submission
@@ -67,8 +81,8 @@ removing their timing lines.
 - one server slot
 
 Smaller contexts can be selected through `CTX_SIZE` when less memory is
-available. The model supports a 262,144-token context, but the V2 256K runtime
-lane is not promoted until it passes the same full-depth stability gate.
+available. The model supports a 262,144-token context, but the 256K runtime lane
+is not promoted until it passes the same full-depth stability gate.
 
 ## Linux support
 
@@ -136,10 +150,10 @@ vulkaninfo --summary
 
 ## Build
 
-Clone the V2 release branch and build a static Vulkan runtime:
+Clone the V3 release branch and build a static Vulkan runtime:
 
 ```bash
-git clone --branch agent/laguna-radv-device-lost-20260724 --depth 1 \
+git clone --branch agent/laguna-s21-runtime-v3 --depth 1 \
   https://github.com/ciru-ai/ROCmFPX.git
 cd ROCmFPX
 JOBS=8 scripts/build-laguna-strix-vulkan.sh
@@ -161,14 +175,16 @@ cloning, confirm it before building:
 git rev-parse HEAD
 ```
 
-Run the two release checks from the repository root:
+Run the focused release checks from the repository root:
 
 ```bash
+build-laguna-strix-vulkan/bin/test-json-schema-to-grammar
 build-laguna-strix-vulkan/bin/test-chat-auto-parser
+build-laguna-strix-vulkan/bin/test-chat --template poolside-Laguna-S-2.1.jinja
 build-laguna-strix-vulkan/bin/test-llama-archs
 ```
 
-## Run the validated 128K V2 profile
+## Run the validated 128K V3 profile
 
 The supervised launcher is recommended on RADV. It performs the Vulkan/driver
 preflight, invokes the safe runner, captures DeviceLost evidence, and preserves
@@ -183,7 +199,7 @@ Diagnostics default to
 `${XDG_STATE_HOME:-$HOME/.local/state}/rocmfpx/laguna-vulkan-failures`.
 Override that location with `DIAGNOSTIC_ROOT`.
 
-The direct runner uses the same V2 safe defaults without supervision:
+The direct runner uses the same safe defaults without supervision:
 
 ```bash
 scripts/run-laguna-s21-rocmfp4-v4.sh \
@@ -214,16 +230,22 @@ The safe defaults are:
 STABILITY_MODE=safe
 CTX_SIZE=131072
 UBATCH_SIZE=512
+CTX_CHECKPOINTS=0
 VK_MAX_NODES_PER_SUBMIT=10
 VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH=4
 ```
 
 The launcher exports the two `GGML_VK_*` variables consumed by the runtime.
+Context checkpoints are disabled for Laguna because the on-device checkpoint
+invalidation path can crash during a divergent long-context request. This does
+not disable the normal KV cache. `CTX_CHECKPOINTS` remains available for
+explicit diagnostic testing, but values above zero are not part of the
+validated profile until repeated 128K multi-turn and cache-replay gates pass.
 
 ### Experimental 256K lane
 
 The model's 256K context remains available for explicit testing, but it is not
-the V2 safe default:
+the safe default:
 
 ```bash
 STABILITY_MODE=performance \
@@ -240,6 +262,27 @@ Check readiness:
 curl http://127.0.0.1:8080/health
 curl http://127.0.0.1:8080/v1/models
 ```
+
+## Hipfire template compatibility
+
+Hipfire releases that do not implement the Hugging Face `{% generation %}`
+extension otherwise reject the embedded template and silently raw-encode the
+user text, producing incoherent output. Runtime V3's Laguna S template avoids
+that extension.
+
+For an existing `.mq4` file with the older embedded template, point Hipfire at
+the V3 template and force a fresh one-shot daemon:
+
+```bash
+HIPFIRE_LOCAL=1 \
+HIPFIRE_CHAT_TEMPLATE_FILE="$PWD/models/templates/poolside-Laguna-S-2.1.jinja" \
+  hipfire run ~/.hipfire/models/laguna-s21.mq4 --max-tokens 64 \
+  "The capital of France is"
+```
+
+The override fixes prompt rendering without re-quantizing the weights. If a
+background Hipfire daemon is already running, stop it with `hipfire stop` before
+testing without `HIPFIRE_LOCAL=1`.
 
 ## Recipe
 
