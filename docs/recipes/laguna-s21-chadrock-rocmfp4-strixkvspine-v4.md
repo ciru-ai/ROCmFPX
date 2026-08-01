@@ -230,11 +230,17 @@ The safe defaults are:
 STABILITY_MODE=safe
 CTX_SIZE=131072
 UBATCH_SIZE=512
+CTX_CHECKPOINTS=0
 VK_MAX_NODES_PER_SUBMIT=10
 VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH=4
 ```
 
 The launcher exports the two `GGML_VK_*` variables consumed by the runtime.
+Context checkpoints are disabled for Laguna because the on-device checkpoint
+invalidation path can crash during a divergent long-context request. This does
+not disable the normal KV cache. `CTX_CHECKPOINTS` remains available for
+explicit diagnostic testing, but values above zero are not part of the
+validated profile until repeated 128K multi-turn and cache-replay gates pass.
 
 ### Experimental 256K lane
 

@@ -18,6 +18,7 @@ THREADS="${THREADS:-16}"
 THREADS_BATCH="${THREADS_BATCH:-16}"
 FLASH_ATTN="${FLASH_ATTN:-on}"
 SPLIT_MODE="${SPLIT_MODE:-row}"
+CTX_CHECKPOINTS="${CTX_CHECKPOINTS:-0}"
 
 case "$STABILITY_MODE" in
     safe)
@@ -54,6 +55,11 @@ done
 
 if [[ ! "$VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH" =~ ^[0-9]+$ ]]; then
     echo "VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH must be a non-negative integer, got: $VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH" >&2
+    exit 2
+fi
+
+if [[ ! "$CTX_CHECKPOINTS" =~ ^[0-9]+$ ]]; then
+    echo "CTX_CHECKPOINTS must be a non-negative integer, got: $CTX_CHECKPOINTS" >&2
     exit 2
 fi
 
@@ -121,6 +127,7 @@ server_args=(
     --ubatch-size "$UBATCH_SIZE" \
     --threads "$THREADS" \
     --threads-batch "$THREADS_BATCH" \
+    --ctx-checkpoints "$CTX_CHECKPOINTS" \
     --temp 1.0 \
     --top-p 1.0 \
     --top-k 20 \
@@ -140,6 +147,7 @@ echo "  runtime_release=$RUNTIME_RELEASE" >&2
 echo "  mode=$STABILITY_MODE context=$CTX_SIZE batch=$BATCH_SIZE ubatch=$UBATCH_SIZE" >&2
 echo "  flash_attn=$FLASH_ATTN split_mode=$SPLIT_MODE max_nodes_per_submit=$VK_MAX_NODES_PER_SUBMIT" >&2
 echo "  fa_max_workgroups_x_per_dispatch=$VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH" >&2
+echo "  ctx_checkpoints=$CTX_CHECKPOINTS" >&2
 echo "  binary=$BIN" >&2
 echo "  binary_sha256=$(sha256sum "$BIN" | awk '{print $1}')" >&2
 
