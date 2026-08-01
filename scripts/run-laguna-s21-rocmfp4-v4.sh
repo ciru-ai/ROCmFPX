@@ -4,7 +4,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUNTIME_RELEASE="V2"
+RUNTIME_RELEASE="V3"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build-laguna-strix-vulkan}"
 BIN="${BIN:-${6:-$BUILD_DIR/bin/llama-server}}"
 MODEL="${MODEL:-${1:-}}"
