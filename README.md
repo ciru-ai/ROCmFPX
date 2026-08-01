@@ -13,31 +13,7 @@ The first reproducible DualView/Ornith release remains tagged
 `dualview-ornith-35b-v1`; this branch forward-ports that runtime onto the
 maintained ROCmFPX/llama.cpp line.
 
-## Disclosure
-
-**#AD #AMDAI**
-
-A huge thank you to AMD for providing the hardware that powers the ongoing
-development of ROCmFPX.
-
-The development system provided by AMD includes:
-
-- AMD Ryzen™ Threadripper™ 9980X
-- AMD Radeon™ AI PRO R9700 GPU
-- 128 GB ECC DDR5 Memory
-- 2 TB NVMe SSD
-
-This hardware enables me to continue developing, optimizing, benchmarking, and
-testing ROCmFPX for the community. AMD provided this hardware as part of a
-creator partnership. All development, benchmarks, code, testing, documentation,
-and opinions shared in this repository are my own.
-
-Thank you, AMD, for supporting the continued advancement of open AI development
-on Radeon hardware.
-
-**#AD #AMDAI**
-
-## Developer Update — ROCmFP2 Lands On Main (July 2026)
+## ROCmFP2 On Main
 
 ROCmFP2 is now available on the canonical `main` branch as
 `Q2_0_ROCMFPX`. It uses a 2.50-bpw block layout with an S40
@@ -45,8 +21,7 @@ ROCmFP2 is now available on the canonical `main` branch as
 model storage and memory traffic compared with ROCmFP4. The 2.50-bpw figure
 describes native ROCmFP2 weight blocks; complete GGUF BPW can be higher because
 files also contain metadata and tensors stored in other types. The latest
-Vulkan dense and routed/MoE Q8_1 decode kernels landed through
-[PR #42](https://github.com/charlie12345/ROCmFPX/pull/42).
+Vulkan dense and routed/MoE Q8_1 decode kernels are included on `main`.
 
 [Download the current `main` source (ZIP)](https://github.com/ciru-ai/ROCmFPX/archive/refs/heads/main.zip)
 or use the clone command in [Quick Start](#quick-start-strix-halo--gfx1151).
@@ -305,10 +280,11 @@ kernel coverage.
 This work builds on `llama.cpp`; upstream authors and contributors retain credit
 under the MIT license. See `AUTHORS`, `LICENSE`, and `THIRD_PARTY_NOTICES.md`.
 
-ROCmFP4 and ROCmFPX experiment work in this repository is maintained by
-`charlie12345` / `caf`.
+Ciru maintains this repository and its ROCmFPX integration. Earlier ROCmFP4 and
+ROCmFPX work remains credited through the repository history and project
+notices.
 
-Additional ROCmFPX contributors:
+Major contributions in this tree include:
 
 - `ciru-ai`: ROCmFP2 core format/runtime and frozen codebook; ROCmFP3 Vulkan
   matvec/dequant speed path.
