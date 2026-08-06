@@ -142,6 +142,22 @@ static void test(void) {
     argv = {"binary_name", "-lm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    // HY3 strict MTP control is server-only
+    argv = {"binary_name", "--no-spec-mtp-strict"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_EMBEDDING));
+
+    // Qwen strict MTP control is server/CLI-only
+    argv = {"binary_name", "--spec-mtp-strict-qwen"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_EMBEDDING));
+
+    // a negative draft maximum must not wrap when sizing recurrent rollback state
+    argv = {"binary_name", "--spec-draft-n-max", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+
+    // negated arg
+    argv = {"binary_name", "--no-mmap"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+
     printf("test-arg-parser: test valid usage\n\n");
 
     argv = {"binary_name", "-m", "model_file.gguf"};
@@ -186,6 +202,41 @@ static void test(void) {
     argv = {"binary_name", "-lm", "dio"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
+
+    {
+        common_params strict_params;
+
+        argv = {"binary_name", "--no-spec-mtp-strict"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), strict_params, LLAMA_EXAMPLE_SERVER));
+        assert(strict_params.speculative.mtp_strict == false);
+
+        argv = {"binary_name", "--spec-mtp-strict"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), strict_params, LLAMA_EXAMPLE_SERVER));
+        assert(strict_params.speculative.mtp_strict == true);
+
+        assert(strict_params.speculative.mtp_strict_qwen == false);
+        strict_params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        strict_params.speculative.draft.n_max = 6;
+        assert(strict_params.speculative.need_n_rs_seq() == 6);
+        strict_params.speculative.draft.n_max = -1;
+        assert(strict_params.speculative.need_n_rs_seq() == 0);
+        strict_params.speculative.draft.n_max = 6;
+
+        argv = {"binary_name", "--spec-mtp-strict-qwen"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), strict_params, LLAMA_EXAMPLE_SERVER));
+        assert(strict_params.speculative.mtp_strict_qwen == true);
+        assert(strict_params.speculative.need_n_rs_seq() == 6);
+
+        argv = {"binary_name", "--no-spec-mtp-strict-qwen"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), strict_params, LLAMA_EXAMPLE_SERVER));
+        assert(strict_params.speculative.mtp_strict_qwen == false);
+        assert(strict_params.speculative.need_n_rs_seq() == 6);
+
+        common_params cli_strict_params;
+        argv = {"binary_name", "-m", "model_file.gguf", "--spec-mtp-strict-qwen"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), cli_strict_params, LLAMA_EXAMPLE_CLI));
+        assert(cli_strict_params.speculative.mtp_strict_qwen == true);
+    }
 
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};

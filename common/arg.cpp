@@ -3822,6 +3822,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     //
 
     add_opt(common_arg(
+        {"--spec-mtp-strict"},
+        {"--no-spec-mtp-strict"},
+        "use single-row target verification for exact greedy HY3 MTP output; may reduce throughput and requires one server slot (auto parallel selects one; default: enabled)",
+        [](common_params & params, bool value) {
+            params.speculative.mtp_strict = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_MTP_STRICT"));
+    add_opt(common_arg(
+        {"--spec-mtp-strict-qwen"},
+        {"--no-spec-mtp-strict-qwen"},
+        "use boundary-safe multi-row verification with bounded recurrent rollback for exact greedy Qwen35/Qwen35MoE MTP output; requires one slot/sequence (default: disabled)",
+        [](common_params & params, bool value) {
+            params.speculative.mtp_strict_qwen = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_STRICT_QWEN"));
+    add_opt(common_arg(
         {"--spec-draft-hf", "-hfd", "-hfrd", "--hf-repo-draft"}, "<user>/<model>[:quant]",
         "Same as --hf-repo, but for the draft model (default: unused)",
         [](common_params & params, const std::string & value) {
@@ -3994,6 +4010,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--spec-draft-n-max"}, "N",
         string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
         [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
             params.speculative.draft.n_max = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
