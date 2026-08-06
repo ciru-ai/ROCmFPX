@@ -1,0 +1,82 @@
+name: ROCmFPX reference check
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - experimental-rocmfpx-branch
+    paths:
+      - 'ggml/rocmfpx/**'
+      - 'src/llama-quant.cpp'
+      - 'include/llama.h'
+      - 'scripts/check-rocmfpx-*.sh'
+      - 'scripts/check-rocmfp2-*.sh'
+      - 'scripts/check-release-recipe-map.py'
+      - 'scripts/sweep-rocmfpx-*.sh'
+      - 'scripts/build-rocmfpx-*.sh'
+      - 'docs/recipes/**'
+      - '.github/workflows/check-rocmfpx.yml'
+  pull_request:
+    paths:
+      - 'ggml/rocmfpx/**'
+      - 'src/llama-quant.cpp'
+      - 'include/llama.h'
+      - 'scripts/check-rocmfpx-*.sh'
+      - 'scripts/check-rocmfp2-*.sh'
+      - 'scripts/check-release-recipe-map.py'
+      - 'scripts/sweep-rocmfpx-*.sh'
+      - 'scripts/build-rocmfpx-*.sh'
+      - 'docs/recipes/**'
+      - '.github/workflows/check-rocmfpx.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  rocmfpx-reference:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Python converter smoke
+        run: |
+          python3 -m py_compile convert_hf_to_gguf.py convert_modular.py conversion/base.py conversion/__init__.py conversion/diffusion_gemma.py conversion/llama.py
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path("convert_hf_to_gguf.py").read_text(encoding="utf-8")
+          missing = [flag for flag in ("--fp8-as-q8", "--target-model-dir") if flag not in source]
+          if missing:
+              raise SystemExit(f"missing converter option(s): {', '.join(missing)}")
+          PY
+
+      - name: ROCmFPX script syntax
+        run: |
+          for s in scripts/check-rocmfpx-*.sh scripts/sweep-rocmfpx-*.sh scripts/build-rocmfpx-*.sh; do
+            bash -n "$s"
+          done
+
+      - name: Released model recipe map
+        run: python3 scripts/check-release-recipe-map.py
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake
+
+      - name: Build reference + backend ops
+        run: |
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF
+          cmake --build build --target test-backend-ops -j 2
+
+      - name: Reference probe
+        run: scripts/check-rocmfpx-reference.sh
+
+      - name: ROCmFP2 reference probe
+        run: scripts/check-rocmfp2-reference.sh
+
+      - name: CPU ROCmFPX backend ops
+        run: |
+          ./build/bin/test-backend-ops test -o MUL_MAT,GET_ROWS,CPY,SET_ROWS -b CPU

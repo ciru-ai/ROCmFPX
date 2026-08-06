@@ -206,6 +206,10 @@ add_library(ggml-base
             ggml-threading.h
             ggml-quants.c
             ggml-quants.h
+            ../rocmfp4/rocmfp4.c
+            ../rocmfp4/rocmfp4.h
+            ../rocmfpx/rocmfpx.c
+            ../rocmfpx/rocmfpx.h
             gguf.cpp)
 
 set_target_properties(ggml-base PROPERTIES
@@ -220,23 +224,6 @@ endif()
 
 if (GGML_SCHED_NO_REALLOC)
     target_compile_definitions(ggml-base PUBLIC GGML_SCHED_NO_REALLOC)
-endif()
-
-if (GGML_OPENMP)
-    find_package(OpenMP)
-    if (OpenMP_FOUND)
-        set(GGML_OPENMP_ENABLED "ON" CACHE INTERNAL "")
-    else()
-        set(GGML_OPENMP_ENABLED "OFF" CACHE INTERNAL "")
-        message(WARNING "OpenMP not found")
-    endif()
-else()
-    set(GGML_OPENMP_ENABLED "OFF" CACHE INTERNAL "")
-endif()
-
-if (GGML_OPENMP_ENABLED)
-    target_compile_definitions(ggml-base PRIVATE GGML_USE_OPENMP)
-    target_link_libraries(ggml-base PRIVATE OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
 endif()
 
 add_library(ggml
