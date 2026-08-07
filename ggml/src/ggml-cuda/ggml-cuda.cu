@@ -84,6 +84,9 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -91,6 +94,22 @@
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+
+static void * ggml_cuda_aligned_alloc(size_t alignment, size_t size) {
+#if defined(_WIN32)
+    return _aligned_malloc(size, alignment);
+#else
+    return std::aligned_alloc(alignment, size);
+#endif
+}
+
+static void ggml_cuda_aligned_free(void * ptr) {
+#if defined(_WIN32)
+    _aligned_free(ptr);
+#else
+    std::free(ptr);
+#endif
+}
 
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
@@ -1248,7 +1267,7 @@ static void * ggml_cuda_q7_panel16_repack_host(
         const int64_t nrows,
         const int64_t ncols,
         const size_t panel_size) {
-    void * storage = std::aligned_alloc(
+    void * storage = ggml_cuda_aligned_alloc(
         alignof(block_rocmfp7_panel16),
         panel_size);
     if (storage == nullptr) {
@@ -1327,7 +1346,7 @@ static void * ggml_cuda_q7_q8_view_repack_host(
     const size_t allocation_size =
         (view_size + alignment - 1) & ~(alignment - 1);
     void * storage =
-        std::aligned_alloc(alignment, allocation_size);
+        ggml_cuda_aligned_alloc(alignment, allocation_size);
     if (storage == nullptr) {
         return nullptr;
     }
@@ -1340,7 +1359,7 @@ static void * ggml_cuda_q7_q8_view_repack_host(
             storage,
             nrows,
             macros_per_row)) {
-        std::free(storage);
+        ggml_cuda_aligned_free(storage);
         return nullptr;
     }
 
@@ -2068,7 +2087,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
     const bool panel_ready = panel_host != nullptr;
-    std::free(panel_host);
+    ggml_cuda_aligned_free(panel_host);
     if (panel_entry != nullptr && panel_ready) {
         if (ggml_cuda_q7_panel16_publish(
                 ctx,
@@ -2087,7 +2106,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         }
     }
     const bool q8_ready = q8_host != nullptr;
-    std::free(q8_host);
+    ggml_cuda_aligned_free(q8_host);
     if (q8_entry != nullptr && q8_ready) {
         if (ggml_cuda_q7_q8_view_publish(
                 ctx,
