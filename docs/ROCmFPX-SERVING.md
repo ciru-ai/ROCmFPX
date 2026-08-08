@@ -421,6 +421,10 @@ Use `scripts/rocmfpx-dynamic-draft.py` for full Dynamic Drafting. It injects
 `speculative.n_max`, `speculative.n_min`, `speculative.p_min`, and
 `speculative.p_split` into each request, then optionally records
 `draft_n/draft_n_accepted` feedback from responses and adjusts later requests.
+The server accepts and reports `speculative.p_split` for client compatibility,
+but the current server-side draft-simple/MTP implementations do not branch and
+therefore do not consume it. Dynamic behavior in those paths is controlled by
+`n_max`, `n_min`, and `p_min`.
 The wrapper scopes learned feedback by profile, inferred workload mode, backend,
 model, and context size so a Vulkan JSON run does not drag down a ROCm coding
 run. Modes are inferred automatically, or can be pinned with `--mode coding`,

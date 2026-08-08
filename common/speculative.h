@@ -48,6 +48,10 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // per-request overrides (-1 means use the server startup value)
+    int32_t n_min = -1;
+    float   p_min = -1.0f;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

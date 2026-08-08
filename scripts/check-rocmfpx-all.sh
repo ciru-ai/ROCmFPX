@@ -9,6 +9,7 @@ SKIP_OPTIONAL="${SKIP_OPTIONAL:-1}"
 
 cd "$ROOT"
 
+python3 scripts/check-rocmfpx-preservation.py
 scripts/check-rocmfpx-qwen-all.sh
 scripts/check-rocmfpx-model-capabilities.sh
 

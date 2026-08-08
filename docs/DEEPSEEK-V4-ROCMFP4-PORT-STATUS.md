@@ -1,5 +1,14 @@
 # DeepSeek V4 ROCmFP4 Port Status
 
+> Historical record (2026-08): this report describes the isolated pre-sync
+> DeepSeek V4 port. Its `run-deepseek-v4-*` wrappers and the converter options
+> `--deepseek4-max-layers` / `--deepseek4-include-mtp` are not part of the
+> current modular converter tree, so the commands below are archival and must
+> not be treated as current run instructions. The current converter's generic
+> MTP export capability guard supersedes the former DeepSeek-specific option
+> guard. Recreate and validate compatible wrappers before attempting this
+> workflow on current `main`.
+
 ## Target
 
 Convert the original checkpoint:

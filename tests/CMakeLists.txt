@@ -272,6 +272,10 @@ llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 
+# Manual model-level diagnostic. It is built but not registered with CTest
+# because it requires an explicitly supplied model, prompt, and output path.
+llama_build(test-raw-fp32-logits.cpp)
+
 # Test for state restore with fragmented KV cache
 # Requires a model, uses same args pattern as test-thread-safety
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")

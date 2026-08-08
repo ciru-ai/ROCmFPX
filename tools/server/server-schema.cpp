@@ -194,37 +194,25 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     // Speculative decoding params
     //
 
-    // TODO: to keep things simple, we disable speculative parameter adjustments for now
-#if 0
-    // TODO: for now, be able to adjust only the draft-model based speculative parameters
     add((new field_num("speculative.n_max", params.speculative.draft.n_max))
-        ->set_hard_limits(0, INT32_MAX)
+        ->set_limits(0, std::max(0, params_base.speculative.draft.n_max))
         ->set_desc("Maximum number of tokens to draft during speculative decoding"));
 
     add((new field_num("speculative.n_min", params.speculative.draft.n_min))
-        ->set_hard_limits(0, INT32_MAX)
-        ->set_desc("Minimum number of draft tokens to use for speculative decoding");
-
-    add((new field_num("speculative.p_min", params.speculative.draft.p_min))
-        ->set_hard_limits(0.0f, 1.0f)
-        ->set_desc("Minimum speculative decoding probability for draft tokens (0 = greedy)"));
-
-
-    add((new field_str("speculative.type"))
-        ->set_desc("Speculative decoding method (for debugging and research purposes)")
-        ->set_handler([&](field_eval_context & ctx, const json & data) {
-            ctx.params.speculative.types = { common_speculative_type_from_name(data.at("speculative.type").get<std::string>()) };
+        ->set_desc("Minimum number of draft tokens to use for speculative decoding")
+        ->set_handler([](field_eval_context & ctx, const json & data) {
+            const int32_t value = data.at("speculative.n_min").get<int32_t>();
+            ctx.params.speculative.draft.n_min = std::max(
+                    0, std::min(value, ctx.params.speculative.draft.n_max));
         }));
 
-    add((new field_num("speculative.ngram_size_n", params.speculative.ngram_simple.size_n))
-        ->set_desc("Ngram size for lookup in ngram-based speculative decoding"));
+    add((new field_num("speculative.p_min", params.speculative.draft.p_min))
+        ->set_limits(0.0f, 1.0f)
+        ->set_desc("Minimum speculative decoding probability for draft tokens (0 = greedy)"));
 
-    add((new field_num("speculative.ngram_size_m", params.speculative.ngram_simple.size_m))
-        ->set_desc("Mgram size for speculative tokens in ngram-based speculative decoding"));
-
-    add((new field_num("speculative.ngram_min_hits", params.speculative.ngram_simple.min_hits))
-        ->set_desc("Minimum hits at ngram lookup for mgram to be proposed"));
-#endif
+    add((new field_num("speculative.p_split", params.speculative.draft.p_split))
+        ->set_limits(0.0f, 1.0f)
+        ->set_desc("Speculative decoding branch split probability"));
 
     add((new field_json("lora"))
         ->set_desc("A list of LoRA adapters to apply to this request. Each entry must have `id` and `scale` fields. Adapters not listed default to scale 0.0")

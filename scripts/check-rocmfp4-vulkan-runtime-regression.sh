@@ -57,6 +57,30 @@ check_case() {
     }'
 }
 
+check_mul_mat_id() {
+    local type="$1"
+    local output
+
+    output="$(env -u GGML_VK_FORCE_MMVQ GGML_VK_DISABLE_MMVQ=1 \
+        "$BIN" perf \
+            -b Vulkan0 \
+            -o MUL_MAT_ID \
+            -p "type_a=${type},type_b=f32,n_mats=8,n_used=2,b=0,m=64,n=32,k=2048" \
+            --output console)"
+    printf "%s\n" "$output"
+
+    if ! grep -Fq "us/run" <<< "$output"; then
+        echo "FAIL: ${type} Vulkan MUL_MAT_ID regression" >&2
+        exit 1
+    fi
+
+    echo "PASS: ${type} Vulkan MUL_MAT_ID"
+}
+
+for type in q4_0_rocmfp4 q4_0_rocmfp4_fast q2_0_rocmfpx q3_0_rocmfpx q6_0_rocmfpx q8_0_rocmfpx; do
+    check_mul_mat_id "$type"
+done
+
 check_case "q4_0_rocmfp4_fast n=1" q4_0_rocmfp4_fast 1 "$MAX_FAST_US"
 check_case "q4_0_rocmfp4 n=1"      q4_0_rocmfp4      1 "$MAX_DUAL_US"
 check_case "q4_0_rocmfp4_fast n=2" q4_0_rocmfp4_fast 2 "$MAX_FAST_N2_US"
