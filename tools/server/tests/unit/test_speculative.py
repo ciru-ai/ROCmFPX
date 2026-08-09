@@ -124,6 +124,33 @@ def test_request_level_speculative_params_are_reported_and_clamped():
         assert settings["speculative.p_split"] == pytest.approx(expected[3])
 
 
+def test_combined_speculator_omitted_request_uses_largest_capacity():
+    global server
+    server.spec_type = "ngram-mod,draft-simple"
+    server.spec_draft_n_max = 4
+    server.spec_ngram_mod_n_match = 24
+    server.spec_ngram_mod_n_min = 32
+    server.spec_ngram_mod_n_max = 32
+    server.start()
+
+    request = {
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 16,
+    }
+    res = server.make_request("POST", "/completion", data=request)
+    assert res.status_code == 200
+    assert res.body["generation_settings"]["speculative.n_max"] == 32
+
+    res = server.make_request("POST", "/completion", data={
+        **request,
+        "speculative.n_max": 2,
+    })
+    assert res.status_code == 200
+    assert res.body["generation_settings"]["speculative.n_max"] == 2
+
+
 def test_slot_ctx_not_exceeded():
     global server
     server.n_ctx = 256

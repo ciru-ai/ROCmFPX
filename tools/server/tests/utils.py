@@ -98,6 +98,9 @@ class ServerProcess:
     spec_type: str | None = None
     spec_draft_n_min: int | None = None
     spec_draft_n_max: int | None = None
+    spec_ngram_mod_n_match: int | None = None
+    spec_ngram_mod_n_min: int | None = None
+    spec_ngram_mod_n_max: int | None = None
     no_ui: bool | None = None
     jinja: bool | None = None
     reasoning_format: Literal['deepseek', 'none', 'nothink'] | None = None
@@ -237,6 +240,12 @@ class ServerProcess:
             server_args.extend(["--spec-draft-n-max", self.spec_draft_n_max])
         if self.spec_draft_n_min:
             server_args.extend(["--spec-draft-n-min", self.spec_draft_n_min])
+        if self.spec_ngram_mod_n_match:
+            server_args.extend(["--spec-ngram-mod-n-match", self.spec_ngram_mod_n_match])
+        if self.spec_ngram_mod_n_min:
+            server_args.extend(["--spec-ngram-mod-n-min", self.spec_ngram_mod_n_min])
+        if self.spec_ngram_mod_n_max:
+            server_args.extend(["--spec-ngram-mod-n-max", self.spec_ngram_mod_n_max])
         if self.no_ui:
             server_args.append("--no-ui")
         if self.no_models_autoload:

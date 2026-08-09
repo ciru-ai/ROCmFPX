@@ -510,6 +510,11 @@ task_params eval_llama_cmpl_schema(
     // Sampling parameter defaults are loaded from the global server context (but individual requests can still them)
     params.sampling      = params_base.sampling;
     params.speculative   = params_base.speculative;
+    // The request-wide draft cap must cover every enabled speculator. Individual
+    // implementations retain their own caps from params_base (for example, MTP
+    // can stay at 4 while ngram-mod proposes up to 32). An explicit request field
+    // can still lower this shared cap through the schema below.
+    params.speculative.draft.n_max = common_speculative_n_max(&params_base.speculative);
     params.n_keep        = params_base.n_keep;
     params.n_predict     = params_base.n_predict;
     params.n_cache_reuse = params_base.n_cache_reuse;
