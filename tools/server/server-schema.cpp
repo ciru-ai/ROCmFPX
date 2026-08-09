@@ -195,7 +195,7 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     //
 
     add((new field_num("speculative.n_max", params.speculative.draft.n_max))
-        ->set_limits(0, std::max(0, params_base.speculative.draft.n_max))
+        ->set_limits(0, std::max(0, common_speculative_n_max(&params_base.speculative)))
         ->set_desc("Maximum number of tokens to draft during speculative decoding"));
 
     add((new field_num("speculative.n_min", params.speculative.draft.n_min))
