@@ -30,16 +30,27 @@ views for the exact published artifact.
 
 ## Build
 
-Install a HIP/ROCm toolchain with gfx1151 support, CMake, Ninja, a C/C++
-toolchain, Git, and Python 3. On Ubuntu or Debian, the host build tools are:
+### Easiest non-NixOS path: Ubuntu 24.04
+
+For a Ryzen AI Max / Radeon 8060S system, use Ubuntu 24.04 and follow AMD's
+[current Ryzen ROCm installation guide](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installryz/native_linux/install-ryzen.html).
+Install the host build tools:
 
 ```bash
 sudo apt update
 sudo apt install -y build-essential cmake ninja-build git python3
 ```
 
-Install ROCm using AMD's current instructions for your distribution, then
-clone both pinned trees:
+Confirm that ROCm is installed in the standard location and recognizes the
+gfx1151 GPU:
+
+```bash
+export ROCM_PATH=/opt/rocm
+test -x "$ROCM_PATH/llvm/bin/clang++"
+"$ROCM_PATH/bin/rocminfo" | grep -m1 gfx1151
+```
+
+Then clone both pinned trees:
 
 ```bash
 git clone https://github.com/ciru-ai/ROCmFPX.git
@@ -53,8 +64,14 @@ git -C ../composable_kernel checkout fdf4bb7fcc984811cef48ce817d89aac064b984a
 Configure and build:
 
 ```bash
+export ROCM_PATH=/opt/rocm
+
 cmake -S . -B build-promptforge -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER="$ROCM_PATH/llvm/bin/clang" \
+  -DCMAKE_CXX_COMPILER="$ROCM_PATH/llvm/bin/clang++" \
+  -DCMAKE_HIP_COMPILER="$ROCM_PATH/llvm/bin/clang++" \
+  -DCMAKE_PREFIX_PATH="$ROCM_PATH" \
   -DGGML_HIP=ON \
   -DGGML_CUDA=OFF \
   -DGGML_VULKAN=OFF \
@@ -74,9 +91,11 @@ cmake -S . -B build-promptforge -G Ninja \
 cmake --build build-promptforge --target llama-server -j"$(nproc)"
 ```
 
-The release was validated on NixOS with the pinned TheRock toolchain. The
-Ubuntu/Debian commands above describe the portable source build and require a
-ROCm installation that exposes gfx1151 to HIP.
+The release binary was validated on NixOS with the pinned TheRock toolchain.
+The Ubuntu path above is the intended portable source build for gfx1151. Other
+Linux distributions can use the same CMake command when their HIP toolchain
+supports gfx1151; change `ROCM_PATH` to the toolchain prefix. Those combinations
+are not currently validated by Ciru.
 
 ## Required environment
 
