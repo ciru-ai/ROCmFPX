@@ -60,6 +60,7 @@
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
+#include "ggml-cuda/promptforge.cuh"
 #include "ggml-cuda/solve_tri.cuh"
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
@@ -2631,6 +2632,13 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (promptforge_try_gdn_qkvz(&ctx, src0, src1, dst)) {
+        return;
+    }
+    if (promptforge_try_down(&ctx, src0, src1, dst)) {
+        return;
+    }
+
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
@@ -4198,6 +4206,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_tensor * glu  = cgraph->nodes[i + 2];
             ggml_tensor * gate = glu->src[0];
             ggml_tensor * up   = glu->src[1];
+
+            if (op == GGML_OP_MUL_MAT && promptforge_try_fuse_gate_up(cuda_ctx, cgraph->nodes[i], cgraph->nodes[i + 1], glu)) {
+                return 2;
+            }
 
             bool ok = (gate == cgraph->nodes[i] && up == cgraph->nodes[i + 1]) ||
                       (gate == cgraph->nodes[i + 1] && up == cgraph->nodes[i]);
@@ -5972,6 +5984,13 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         /* .device  = */ dev,
         /* .context = */ ctx,
     };
+
+    if (!promptforge_backend_init(device)) {
+        GGML_LOG_ERROR("%s: PromptForge initialization failed\n", __func__);
+        delete cuda_backend;
+        delete ctx;
+        return nullptr;
+    }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;

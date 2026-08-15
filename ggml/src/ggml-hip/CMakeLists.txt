@@ -62,6 +62,16 @@ list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
 list(APPEND GGML_SOURCES_ROCM "../../rocmfp4/rocmfp4_hip.cu")
+
+set(PROMPTFORGE_CK_ROOT "" CACHE PATH "Path to the pinned public Composable Kernel tree")
+set(PROMPTFORGE_CK_INSTANCE
+    "${PROMPTFORGE_CK_ROOT}/library/src/tensor_operation_instance/gpu/gemm_multiply_multiply/device_gemm_multiply_multiply_wmma_c_shuffle_i8_i8_bf16_mk_nk_mn.cpp")
+if (NOT PROMPTFORGE_CK_ROOT)
+    message(FATAL_ERROR "PromptForge requires -DPROMPTFORGE_CK_ROOT=/path/to/composable_kernel")
+elseif (NOT EXISTS "${PROMPTFORGE_CK_INSTANCE}")
+    message(FATAL_ERROR "PromptForge CK instance source not found. Use the pinned revision documented in docs/activefpx-promptforge-qwen38.md: ${PROMPTFORGE_CK_INSTANCE}")
+endif()
+list(APPEND GGML_SOURCES_ROCM "${PROMPTFORGE_CK_INSTANCE}")
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
@@ -94,6 +104,11 @@ ggml_add_backend_library(ggml-hip
                          ${GGML_HEADERS_ROCM}
                          ${GGML_SOURCES_ROCM}
                         )
+
+target_include_directories(ggml-hip PRIVATE
+    "${PROMPTFORGE_CK_ROOT}/include"
+    "${PROMPTFORGE_CK_ROOT}/library/include")
+target_compile_definitions(ggml-hip PRIVATE CK_USE_WMMA=1 CK_ENABLE_INT8=1 CK_ENABLE_BF16=1)
 
 # TODO: do not use CUDA definitions for HIP
 if (NOT GGML_BACKEND_DL)
