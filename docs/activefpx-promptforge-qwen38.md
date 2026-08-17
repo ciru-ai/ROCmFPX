@@ -7,8 +7,8 @@ draft-MTP execution paths while adding prompt-only AMD gfx1151 routes.
 
 ## What the runtime adds
 
-- PromptForge FFN routing for the validated 2,048-row prompt block and its
-  1,476-row tail.
+- PromptForge FFN routing for the validated 2,048-row prompt block, the
+  2,044-row context-checkpoint block, and the 1,476-row tail.
 - A fused gate/up path, fused SwiGLU-to-down packing, and accelerated down
   projection.
 - A merged QKV/Z projection path for the model's recurrent Gated DeltaNet
@@ -105,6 +105,18 @@ export PROMPTFORGE_GDN_SIDECAR=/models/Qwen3.8-27B-CIRU-ActiveFPX-PromptForge-GD
 export PROMPTFORGE_MODE=m2048_fused_tail1476
 export GGML_CUDA_GRAPH_OPT=0
 ```
+
+Keep llama.cpp context checkpoints enabled so growing conversations can reuse
+their processed prefix. The validated setting is:
+
+```bash
+--ctx-checkpoints 32 --cache-ram 8192 --cache-prompt
+```
+
+Do not set `--ctx-checkpoints 0`: that disables the checkpoint state required
+to restore the target, draft-MTP, and speculative-serving prefix. The runtime's
+dedicated 2,044-row PromptForge route preserves accelerated prefill when the
+checkpoint scheduler reserves the final four tokens.
 
 Use the launch settings published on the model card. PromptForge is specialized
 for this model and these companion views; startup fails closed when required

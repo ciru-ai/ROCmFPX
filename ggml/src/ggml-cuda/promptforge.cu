@@ -29,6 +29,7 @@ namespace {
 
 constexpr int PF_LAYERS = 64;
 constexpr int PF_M = 2048;
+constexpr int PF_CHECKPOINT_M = 2044;
 constexpr int PF_TAIL_M = 1476;
 constexpr int PF_H = 5120;
 constexpr int PF_I = 17408;
@@ -93,7 +94,11 @@ using CKDeviceOp = ck::tensor_operation::device::DeviceGemmMultipleDSplitK<
 constexpr int PF_GATE_CK_INDEX_M2048 = 0;
 constexpr int PF_DOWN_CK_INDEX_M2048 = 1;
 constexpr int PF_GDN_CK_INDEX_M2048 = 1;
+constexpr int PF_GDN_CK_INDEX_M2044 = 1;
 constexpr int PF_GDN_CK_INDEX_M1476 = 1;
+// The padded route used by the 1,476-row tail also supports the checkpoint-shaped 2,044-row block.
+constexpr int PF_GATE_CK_INDEX_M2044 = 20;
+constexpr int PF_DOWN_CK_INDEX_M2044 = 20;
 // Validated gfx1151 CK route indices for the 1,476-row prompt tail.
 constexpr int PF_GATE_CK_INDEX_M1476_STAGED = 20;
 constexpr int PF_DOWN_CK_INDEX_M1476_STAGED = 20;
@@ -131,6 +136,12 @@ struct PFState {
     std::unique_ptr<ck::tensor_operation::device::BaseInvoker> down_invoker;
     std::array<std::unique_ptr<ck::tensor_operation::device::BaseArgument>, PF_LAYERS> gate_args;
     std::array<std::unique_ptr<ck::tensor_operation::device::BaseArgument>, PF_LAYERS> down_args;
+    std::unique_ptr<CKDeviceOp> gate_checkpoint2044_op;
+    std::unique_ptr<CKDeviceOp> down_checkpoint2044_op;
+    std::unique_ptr<ck::tensor_operation::device::BaseInvoker> gate_checkpoint2044_invoker;
+    std::unique_ptr<ck::tensor_operation::device::BaseInvoker> down_checkpoint2044_invoker;
+    std::array<std::unique_ptr<ck::tensor_operation::device::BaseArgument>, PF_LAYERS> gate_checkpoint2044_args;
+    std::array<std::unique_ptr<ck::tensor_operation::device::BaseArgument>, PF_LAYERS> down_checkpoint2044_args;
     std::unique_ptr<CKDeviceOp> gate_tail1476_op;
     std::unique_ptr<CKDeviceOp> down_tail1476_op;
     std::unique_ptr<ck::tensor_operation::device::BaseInvoker> gate_tail1476_invoker;
@@ -138,10 +149,13 @@ struct PFState {
     std::array<std::unique_ptr<ck::tensor_operation::device::BaseArgument>, PF_LAYERS> gate_tail1476_args;
     std::array<std::unique_ptr<ck::tensor_operation::device::BaseArgument>, PF_LAYERS> down_tail1476_args;
     std::unique_ptr<CKDeviceOp> gdn_op;
+    std::unique_ptr<CKDeviceOp> gdn_checkpoint2044_op;
     std::unique_ptr<CKDeviceOp> gdn_tail1476_op;
     std::unique_ptr<ck::tensor_operation::device::BaseInvoker> gdn_invoker;
+    std::unique_ptr<ck::tensor_operation::device::BaseInvoker> gdn_checkpoint2044_invoker;
     std::unique_ptr<ck::tensor_operation::device::BaseInvoker> gdn_tail1476_invoker;
     std::array<std::unique_ptr<ck::tensor_operation::device::BaseArgument>, PF_LAYERS> gdn_args;
+    std::array<std::unique_ptr<ck::tensor_operation::device::BaseArgument>, PF_LAYERS> gdn_checkpoint2044_args;
     std::array<std::unique_ptr<ck::tensor_operation::device::BaseArgument>, PF_LAYERS> gdn_tail1476_args;
 
     bool count_active = false;
@@ -539,20 +553,42 @@ bool build_routes(PFState & s) {
     s.down_invoker = s.down_op->MakeInvokerPointer();
 
     if (s.mode == PFMode::m2048_fused_tail1476) {
+        std::vector<std::unique_ptr<CKDeviceOp>> gate_checkpoint_ops;
+        std::vector<std::unique_ptr<CKDeviceOp>> down_checkpoint_ops;
         std::vector<std::unique_ptr<CKDeviceOp>> gate_tail_ops;
         std::vector<std::unique_ptr<CKDeviceOp>> down_tail_ops;
+        ck::tensor_operation::device::instance::
+            add_device_gemm_multiply_multiply_wmma_c_shuffle_i8_i8_bf16_km_nk_mn_instances(gate_checkpoint_ops);
+        ck::tensor_operation::device::instance::
+            add_device_gemm_multiply_multiply_wmma_c_shuffle_i8_i8_bf16_km_nk_mn_instances(down_checkpoint_ops);
         ck::tensor_operation::device::instance::
             add_device_gemm_multiply_multiply_wmma_c_shuffle_i8_i8_bf16_km_nk_mn_instances(gate_tail_ops);
         ck::tensor_operation::device::instance::
             add_device_gemm_multiply_multiply_wmma_c_shuffle_i8_i8_bf16_km_nk_mn_instances(down_tail_ops);
-        if (gate_tail_ops.size() <= PF_GATE_CK_INDEX_M1476_STAGED ||
+        if (gate_checkpoint_ops.size() <= PF_GATE_CK_INDEX_M2044 ||
+            down_checkpoint_ops.size() <= PF_DOWN_CK_INDEX_M2044 ||
+            gate_tail_ops.size() <= PF_GATE_CK_INDEX_M1476_STAGED ||
             down_tail_ops.size() <= PF_DOWN_CK_INDEX_M1476_STAGED) {
-            std::fprintf(stderr, "promptforge: staged M1476 CK indices absent\n");
+            std::fprintf(stderr, "promptforge: checkpoint/tail CK indices absent\n");
             return false;
         }
+        s.gate_checkpoint2044_op = std::move(gate_checkpoint_ops[PF_GATE_CK_INDEX_M2044]);
+        s.down_checkpoint2044_op = std::move(down_checkpoint_ops[PF_DOWN_CK_INDEX_M2044]);
         s.gate_tail1476_op = std::move(gate_tail_ops[PF_GATE_CK_INDEX_M1476_STAGED]);
         s.down_tail1476_op = std::move(down_tail_ops[PF_DOWN_CK_INDEX_M1476_STAGED]);
         for (int layer = 0; layer < PF_LAYERS; ++layer) {
+            auto checkpoint_gate_arg = s.gate_checkpoint2044_op->MakeArgumentPointer(
+                s.gate_a8, s.device_file + s.gate_weight[layer],
+                std::array<const void *, 2>{s.device_file + s.gate_scale[layer], s.gate_a_scale}, s.gate_out,
+                PF_CHECKPOINT_M, 2 * PF_I, PF_H, PF_H, PF_H,
+                std::array<ck::index_t, 2>{0, 0}, 2 * PF_I, 1,
+                PassThrough{}, PassThrough{}, MultiplyMultiply{});
+            auto checkpoint_down_arg = s.down_checkpoint2044_op->MakeArgumentPointer(
+                s.down_a8, s.device_file + s.down_weight[layer],
+                std::array<const void *, 2>{s.device_file + s.down_scale[layer], s.down_a_scale}, s.down_out,
+                PF_CHECKPOINT_M, PF_H, PF_I, PF_I, PF_I,
+                std::array<ck::index_t, 2>{0, 0}, PF_H, 1,
+                PassThrough{}, PassThrough{}, MultiplyMultiply{});
             auto gate_arg = s.gate_tail1476_op->MakeArgumentPointer(
                 s.gate_a8, s.device_file + s.gate_weight[layer],
                 std::array<const void *, 2>{s.device_file + s.gate_scale[layer], s.gate_a_scale}, s.gate_out,
@@ -565,14 +601,20 @@ bool build_routes(PFState & s) {
                 PF_TAIL_M, PF_H, PF_I, PF_I, PF_I,
                 std::array<ck::index_t, 2>{0, 0}, PF_H, 1,
                 PassThrough{}, PassThrough{}, MultiplyMultiply{});
-            if (!s.gate_tail1476_op->IsSupportedArgument(gate_arg.get()) ||
+            if (!s.gate_checkpoint2044_op->IsSupportedArgument(checkpoint_gate_arg.get()) ||
+                !s.down_checkpoint2044_op->IsSupportedArgument(checkpoint_down_arg.get()) ||
+                !s.gate_tail1476_op->IsSupportedArgument(gate_arg.get()) ||
                 !s.down_tail1476_op->IsSupportedArgument(down_arg.get())) {
-                std::fprintf(stderr, "promptforge: staged M1476 CK argument unsupported for layer %d\n", layer);
+                std::fprintf(stderr, "promptforge: checkpoint/tail CK argument unsupported for layer %d\n", layer);
                 return false;
             }
+            s.gate_checkpoint2044_args[layer] = std::move(checkpoint_gate_arg);
+            s.down_checkpoint2044_args[layer] = std::move(checkpoint_down_arg);
             s.gate_tail1476_args[layer] = std::move(gate_arg);
             s.down_tail1476_args[layer] = std::move(down_arg);
         }
+        s.gate_checkpoint2044_invoker = s.gate_checkpoint2044_op->MakeInvokerPointer();
+        s.down_checkpoint2044_invoker = s.down_checkpoint2044_op->MakeInvokerPointer();
         s.gate_tail1476_invoker = s.gate_tail1476_op->MakeInvokerPointer();
         s.down_tail1476_invoker = s.down_tail1476_op->MakeInvokerPointer();
     }
@@ -580,9 +622,11 @@ bool build_routes(PFState & s) {
         std::fprintf(stderr,
             "{\"record\":\"promptforge_init\",\"mode\":\"m2048_fused_tail1476\","
             "\"device_bytes\":%llu,\"gate_ck_index\":%d,\"down_ck_index\":%d,"
+            "\"gate_ck_index_m2044\":%d,\"down_ck_index_m2044\":%d,"
             "\"gate_ck_index_m1476\":%d,\"down_ck_index_m1476\":%d}\n",
             (unsigned long long) PF_FILE_BYTES,
             PF_GATE_CK_INDEX_M2048, PF_DOWN_CK_INDEX_M2048,
+            PF_GATE_CK_INDEX_M2044, PF_DOWN_CK_INDEX_M2044,
             PF_GATE_CK_INDEX_M1476_STAGED, PF_DOWN_CK_INDEX_M1476_STAGED);
     } else {
         std::fprintf(stderr,
@@ -597,17 +641,22 @@ bool build_routes(PFState & s) {
 
 bool build_gdn_routes(PFState & s) {
     std::vector<std::unique_ptr<CKDeviceOp>> gdn_ops;
+    std::vector<std::unique_ptr<CKDeviceOp>> gdn_checkpoint2044_ops;
     std::vector<std::unique_ptr<CKDeviceOp>> gdn_tail1476_ops;
     ck::tensor_operation::device::instance::
         add_device_gemm_multiply_multiply_wmma_c_shuffle_i8_i8_bf16_km_nk_mn_instances(gdn_ops);
     ck::tensor_operation::device::instance::
+        add_device_gemm_multiply_multiply_wmma_c_shuffle_i8_i8_bf16_km_nk_mn_instances(gdn_checkpoint2044_ops);
+    ck::tensor_operation::device::instance::
         add_device_gemm_multiply_multiply_wmma_c_shuffle_i8_i8_bf16_km_nk_mn_instances(gdn_tail1476_ops);
     if (gdn_ops.size() <= PF_GDN_CK_INDEX_M2048 ||
+        gdn_checkpoint2044_ops.size() <= PF_GDN_CK_INDEX_M2044 ||
         gdn_tail1476_ops.size() <= PF_GDN_CK_INDEX_M1476) {
         std::fprintf(stderr, "promptforge: required GDN CK indices absent\n");
         return false;
     }
     s.gdn_op = std::move(gdn_ops[PF_GDN_CK_INDEX_M2048]);
+    s.gdn_checkpoint2044_op = std::move(gdn_checkpoint2044_ops[PF_GDN_CK_INDEX_M2044]);
     s.gdn_tail1476_op = std::move(gdn_tail1476_ops[PF_GDN_CK_INDEX_M1476]);
     for (int layer = 0; layer < PF_LAYERS; ++layer) {
         if (layer % 4 == 3) {
@@ -619,6 +668,12 @@ bool build_gdn_routes(PFState & s) {
             PF_M, PF_GDN_N, PF_H, PF_H, PF_H,
             std::array<ck::index_t, 2>{0, 0}, PF_GDN_N, 1,
             PassThrough{}, PassThrough{}, MultiplyMultiply{});
+        auto checkpoint_arg = s.gdn_checkpoint2044_op->MakeArgumentPointer(
+            s.gate_a8, s.gdn_device_file + s.gdn_weight[layer],
+            std::array<const void *, 2>{s.gdn_device_file + s.gdn_scale[layer], s.gate_a_scale}, s.gate_out,
+            PF_CHECKPOINT_M, PF_GDN_N, PF_H, PF_H, PF_H,
+            std::array<ck::index_t, 2>{0, 0}, PF_GDN_N, 1,
+            PassThrough{}, PassThrough{}, MultiplyMultiply{});
         auto tail_arg = s.gdn_tail1476_op->MakeArgumentPointer(
             s.gate_a8, s.gdn_device_file + s.gdn_weight[layer],
             std::array<const void *, 2>{s.gdn_device_file + s.gdn_scale[layer], s.gate_a_scale}, s.gate_out,
@@ -626,21 +681,24 @@ bool build_gdn_routes(PFState & s) {
             std::array<ck::index_t, 2>{0, 0}, PF_GDN_N, 1,
             PassThrough{}, PassThrough{}, MultiplyMultiply{});
         if (!s.gdn_op->IsSupportedArgument(arg.get()) ||
+            !s.gdn_checkpoint2044_op->IsSupportedArgument(checkpoint_arg.get()) ||
             !s.gdn_tail1476_op->IsSupportedArgument(tail_arg.get())) {
             std::fprintf(stderr, "promptforge: GDN CK argument unsupported for layer %d\n", layer);
             return false;
         }
         s.gdn_args[layer] = std::move(arg);
+        s.gdn_checkpoint2044_args[layer] = std::move(checkpoint_arg);
         s.gdn_tail1476_args[layer] = std::move(tail_arg);
     }
     s.gdn_invoker = s.gdn_op->MakeInvokerPointer();
+    s.gdn_checkpoint2044_invoker = s.gdn_checkpoint2044_op->MakeInvokerPointer();
     s.gdn_tail1476_invoker = s.gdn_tail1476_op->MakeInvokerPointer();
     std::fprintf(stderr,
         "{\"record\":\"promptforge_gdn_init\",\"projection\":\"qkvz_w8\","
         "\"device_bytes\":%llu,\"layers\":48,\"n\":%d,\"k\":%d,"
-        "\"ck_index_m2048\":%d,\"ck_index_m1476\":%d}\n",
+        "\"ck_index_m2048\":%d,\"ck_index_m2044\":%d,\"ck_index_m1476\":%d}\n",
         (unsigned long long) PF_GDN_FILE_BYTES, PF_GDN_N, PF_H,
-        PF_GDN_CK_INDEX_M2048, PF_GDN_CK_INDEX_M1476);
+        PF_GDN_CK_INDEX_M2048, PF_GDN_CK_INDEX_M2044, PF_GDN_CK_INDEX_M1476);
     return true;
 }
 
@@ -658,6 +716,8 @@ void run_gate_fused(PFState & s, int layer, int rows, const float * input, hipSt
                        input, s.gate_a8, s.gate_a_scale, rows, PF_H);
     if (rows == PF_TAIL_M) {
         s.gate_tail1476_invoker->Run(s.gate_tail1476_args[layer].get(), ::StreamConfig{stream, false});
+    } else if (rows == PF_CHECKPOINT_M) {
+        s.gate_checkpoint2044_invoker->Run(s.gate_checkpoint2044_args[layer].get(), ::StreamConfig{stream, false});
     } else {
         s.gate_invoker->Run(s.gate_args[layer].get(), ::StreamConfig{stream, false});
     }
@@ -677,6 +737,8 @@ void run_down(PFState & s, int layer, const float * input, float * output, hipSt
 void run_down_fused(PFState & s, int layer, int rows, float * output, hipStream_t stream) {
     if (rows == PF_TAIL_M) {
         s.down_tail1476_invoker->Run(s.down_tail1476_args[layer].get(), ::StreamConfig{stream, false});
+    } else if (rows == PF_CHECKPOINT_M) {
+        s.down_checkpoint2044_invoker->Run(s.down_checkpoint2044_args[layer].get(), ::StreamConfig{stream, false});
     } else {
         s.down_invoker->Run(s.down_args[layer].get(), ::StreamConfig{stream, false});
     }
@@ -701,6 +763,8 @@ void run_gdn_qkvz(PFState & s, int layer, int rows, const float * input, hipStre
                        input, s.gate_a8, s.gate_a_scale, rows, PF_H);
     if (rows == PF_TAIL_M) {
         s.gdn_tail1476_invoker->Run(s.gdn_tail1476_args[layer].get(), ::StreamConfig{stream, false});
+    } else if (rows == PF_CHECKPOINT_M) {
+        s.gdn_checkpoint2044_invoker->Run(s.gdn_checkpoint2044_args[layer].get(), ::StreamConfig{stream, false});
     } else {
         s.gdn_invoker->Run(s.gdn_args[layer].get(), ::StreamConfig{stream, false});
     }
@@ -784,6 +848,8 @@ bool promptforge_try_gdn_qkvz(ggml_backend_cuda_context * ctx,
 
     const int rows = exact_tensor(input, GGML_TYPE_F32, PF_H, PF_M) &&
                      exact_tensor(dst, GGML_TYPE_F32, output_cols, PF_M) ? PF_M :
+                     exact_tensor(input, GGML_TYPE_F32, PF_H, PF_CHECKPOINT_M) &&
+                     exact_tensor(dst, GGML_TYPE_F32, output_cols, PF_CHECKPOINT_M) ? PF_CHECKPOINT_M :
                      exact_tensor(input, GGML_TYPE_F32, PF_H, PF_TAIL_M) &&
                      exact_tensor(dst, GGML_TYPE_F32, output_cols, PF_TAIL_M) ? PF_TAIL_M : 0;
     if (rows == 0 || !exact_shape(weight, PF_H, output_cols)) {
@@ -843,6 +909,8 @@ bool promptforge_try_fuse_gate_up(ggml_backend_cuda_context * ctx,
         return false;
     }
     const int rows = exact_tensor(glu, GGML_TYPE_F32, PF_I, PF_M) ? PF_M :
+                     s.mode == PFMode::m2048_fused_tail1476 &&
+                     exact_tensor(glu, GGML_TYPE_F32, PF_I, PF_CHECKPOINT_M) ? PF_CHECKPOINT_M :
                      s.mode == PFMode::m2048_fused_tail1476 &&
                      exact_tensor(glu, GGML_TYPE_F32, PF_I, PF_TAIL_M) ? PF_TAIL_M : 0;
     if (rows == 0) return false;
@@ -914,6 +982,9 @@ bool promptforge_try_down(ggml_backend_cuda_context * ctx,
     const int layer = exact_layer(weight, "ffn_down.weight");
     const int rows = exact_tensor(input, GGML_TYPE_F32, PF_I, PF_M) &&
                      exact_tensor(dst, GGML_TYPE_F32, PF_H, PF_M) ? PF_M :
+                     s.mode == PFMode::m2048_fused_tail1476 &&
+                     exact_tensor(input, GGML_TYPE_F32, PF_I, PF_CHECKPOINT_M) &&
+                     exact_tensor(dst, GGML_TYPE_F32, PF_H, PF_CHECKPOINT_M) ? PF_CHECKPOINT_M :
                      s.mode == PFMode::m2048_fused_tail1476 &&
                      exact_tensor(input, GGML_TYPE_F32, PF_I, PF_TAIL_M) &&
                      exact_tensor(dst, GGML_TYPE_F32, PF_H, PF_TAIL_M) ? PF_TAIL_M : 0;
