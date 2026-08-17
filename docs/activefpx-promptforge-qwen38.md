@@ -104,7 +104,12 @@ export PROMPTFORGE_SIDECAR=/models/Qwen3.8-27B-CIRU-ActiveFPX-PromptForge-FFN.pf
 export PROMPTFORGE_GDN_SIDECAR=/models/Qwen3.8-27B-CIRU-ActiveFPX-PromptForge-GDN.pfs
 export PROMPTFORGE_MODE=m2048_fused_tail1476
 export GGML_CUDA_GRAPH_OPT=0
+export LLAMA_MTP_CPU_ARGMAX_FASTPATH=1
 ```
+
+With the published `p_min=0` MTP profile, the CPU argmax fast path selects the
+same greedy draft token without invoking ROCm's unsupported backend TOP_K
+operator or constructing and sorting ten CPU candidates.
 
 Keep llama.cpp context checkpoints enabled so growing conversations can reuse
 their processed prefix. The validated setting is:
