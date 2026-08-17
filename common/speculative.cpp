@@ -12,7 +12,6 @@
 
 #include <algorithm>
 #include <cassert>
-#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -942,11 +941,6 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
 
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
-    bool gpu_argmax_fastpath = false;
-    uint64_t n_gpu_argmax = 0;
-    uint64_t n_cpu_topk = 0;
-    uint64_t n_fastpath_fail = 0;
-
     llama_batch batch;
 
     std::vector<common_sampler_ptr> smpls;
@@ -996,22 +990,6 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
         n_embd = llama_model_n_embd_pre_norm(llama_get_model(ctx_dft));
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
 
-        const char * fastpath_env = std::getenv("LLAMA_MTP_GREEDY_FASTPATH");
-        gpu_argmax_fastpath = fastpath_env != nullptr && std::strcmp(fastpath_env, "1") == 0;
-
-        LOG_INF("{\"record\":\"mtp_gpu_argmax_init\",\"enabled\":%d,\"backend_sampling\":%d,\"p_min\":%.1f,\"sampler\":\"%s\"}\n",
-                (int) gpu_argmax_fastpath,
-                (int) this->params.backend_sampling,
-                this->params.p_min,
-                gpu_argmax_fastpath ? "temp0_argmax_candidate" : "top_k10");
-
-        if (gpu_argmax_fastpath && (!this->params.backend_sampling || this->params.p_min != 0.0f)) {
-            n_fastpath_fail++;
-            LOG_ERR("{\"record\":\"mtp_gpu_argmax_failure\",\"reason\":\"invalid_startup_config\",\"backend_sampling\":%d,\"p_min\":%.9g}\n",
-                    (int) this->params.backend_sampling, this->params.p_min);
-            GGML_ABORT("MTP GPU argmax fast path requires backend sampling and p_min=0");
-        }
-
         LOG_INF("%s: adding speculative implementation 'draft-mtp'\n", __func__);
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
         LOG_INF("%s: - gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s\n", __func__,
@@ -1044,20 +1022,9 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
         if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                if (gpu_argmax_fastpath) {
-                    llama_sampler_chain_add(chain, llama_sampler_init_temp(0.0f));
-                } else {
-                    llama_sampler_chain_add(chain, llama_sampler_init_top_k(MTP_DRAFT_TOP_K));
-                }
+                llama_sampler_chain_add(chain, llama_sampler_init_top_k(MTP_DRAFT_TOP_K));
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
-                    if (gpu_argmax_fastpath) {
-                        n_fastpath_fail++;
-                        LOG_ERR("{\"record\":\"mtp_gpu_argmax_failure\",\"reason\":\"backend_sampler_attach_failed\",\"seq_id\":%d}\n",
-                                (int) seq_id);
-                        llama_sampler_free(chain);
-                        GGML_ABORT("MTP GPU argmax fast path could not attach backend sampler");
-                    }
                     LOG_WRN("%s: backend offload failed for seq_id=%d; using CPU sampler\n", __func__, (int) seq_id);
                     llama_sampler_free(chain);
                     chain = nullptr;
@@ -1104,9 +1071,6 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
     }
 
     ~common_speculative_state_draft_mtp() override {
-        LOG_INF("{\"record\":\"mtp_gpu_argmax_final\",\"enabled\":%d,\"gpu_argmax_calls\":%" PRIu64 ",\"cpu_topk_calls\":%" PRIu64 ",\"failures\":%" PRIu64 "}\n",
-                (int) gpu_argmax_fastpath, n_gpu_argmax, n_cpu_topk, n_fastpath_fail);
-
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1298,13 +1262,6 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            if (gpu_argmax_fastpath && common_speculative_effective_p_min(params, dp) != 0.0f) {
-                n_fastpath_fail++;
-                LOG_ERR("{\"record\":\"mtp_gpu_argmax_failure\",\"reason\":\"effective_p_min_nonzero\",\"seq_id\":%d,\"p_min\":%.9g}\n",
-                        (int) seq_id, common_speculative_effective_p_min(params, dp));
-                GGML_ABORT("MTP GPU argmax fast path refuses a nonzero effective p_min");
-            }
-
             last_n_drafted[seq_id] = 0;
 
             n_drafting++;
@@ -1373,65 +1330,25 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                llama_token id_selected;
-                const float * h_row_selected;
+                const auto * cur_p = common_sampler_sample_top_k_probs(smpl, ctx_dft, i_last[seq_id], MTP_DRAFT_TOP_K);
+                const float * h_row = llama_get_embeddings_pre_norm_ith(ctx_dft, i_last[seq_id]);
 
-                if (gpu_argmax_fastpath) {
-                    const uint32_t n_candidates = llama_get_sampled_candidates_count_ith(ctx_dft, i_last[seq_id]);
-                    if (n_candidates != 1) {
-                        n_fastpath_fail++;
-                        LOG_ERR("{\"record\":\"mtp_gpu_argmax_failure\",\"reason\":\"candidate_count_not_one\",\"seq_id\":%d,\"candidate_count\":%u}\n",
-                                (int) seq_id, n_candidates);
-                        GGML_ABORT("MTP GPU argmax fast path requires exactly one sampled candidate");
+                if (log_debug) {
+                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                        LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                     }
-
-                    const llama_token * candidates = llama_get_sampled_candidates_ith(ctx_dft, i_last[seq_id]);
-                    if (candidates == nullptr) {
-                        n_fastpath_fail++;
-                        LOG_ERR("{\"record\":\"mtp_gpu_argmax_failure\",\"reason\":\"candidate_pointer_null\",\"seq_id\":%d}\n",
-                                (int) seq_id);
-                        GGML_ABORT("MTP GPU argmax fast path received a null candidate pointer");
-                    }
-
-                    id_selected = candidates[0];
-                    const int32_t n_vocab_dft = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
-                    if (id_selected < 0 || id_selected >= n_vocab_dft) {
-                        n_fastpath_fail++;
-                        LOG_ERR("{\"record\":\"mtp_gpu_argmax_failure\",\"reason\":\"candidate_out_of_range\",\"seq_id\":%d,\"token\":%d,\"n_vocab\":%d}\n",
-                                (int) seq_id, (int) id_selected, n_vocab_dft);
-                        GGML_ABORT("MTP GPU argmax fast path received an out-of-range token");
-                    }
-
-                    n_gpu_argmax++;
-                    h_row_selected = llama_get_embeddings_pre_norm_ith(ctx_dft, i_last[seq_id]);
-                } else {
-                    const auto * cur_p = common_sampler_sample_top_k_probs(smpl, ctx_dft, i_last[seq_id], MTP_DRAFT_TOP_K);
-                    n_cpu_topk++;
-                    const float * h_row = llama_get_embeddings_pre_norm_ith(ctx_dft, i_last[seq_id]);
-
-                    if (log_debug) {
-                        for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                            LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                                    seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                                    common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
-                        }
-                    }
-
-                    // add drafted token for each sequence
-                    const llama_token id = cur_p->data[0].id;
-
-                    if (cur_p->data[0].p < common_speculative_effective_p_min(params, dp)) {
-                        drafting[seq_id] = 0;
-                        n_drafting--;
-                        continue;
-                    }
-
-                    id_selected = id;
-                    h_row_selected = h_row;
                 }
 
-                const llama_token id = id_selected;
-                const float * h_row = h_row_selected;
+                // add drafted token for each sequence
+                const llama_token id = cur_p->data[0].id;
+
+                if (cur_p->data[0].p < common_speculative_effective_p_min(params, dp)) {
+                    drafting[seq_id] = 0;
+                    n_drafting--;
+                    continue;
+                }
 
                 common_sampler_accept(smpl, id, true);
 
