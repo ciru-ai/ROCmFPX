@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -941,6 +942,11 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
 
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
+    bool cpu_argmax_fastpath = false;
+    uint64_t n_cpu_argmax = 0;
+    uint64_t n_cpu_topk = 0;
+    uint64_t n_fastpath_fail = 0;
+
     llama_batch batch;
 
     std::vector<common_sampler_ptr> smpls;
@@ -990,6 +996,15 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
         n_embd = llama_model_n_embd_pre_norm(llama_get_model(ctx_dft));
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
 
+        const char * fastpath_env = std::getenv("LLAMA_MTP_CPU_ARGMAX_FASTPATH");
+        cpu_argmax_fastpath = fastpath_env != nullptr && std::strcmp(fastpath_env, "1") == 0;
+        if (cpu_argmax_fastpath && (!this->params.backend_sampling || this->params.p_min != 0.0f)) {
+            ++n_fastpath_fail;
+            GGML_ABORT("MTP CPU argmax fast path requires backend sampling and p_min=0");
+        }
+        LOG_INF("{\"record\":\"mtp_cpu_argmax_init\",\"enabled\":%d,\"p_min\":%.1f}\n",
+                (int) cpu_argmax_fastpath, this->params.p_min);
+
         LOG_INF("%s: adding speculative implementation 'draft-mtp'\n", __func__);
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
         LOG_INF("%s: - gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s\n", __func__,
@@ -1019,7 +1034,7 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling) {
+        if (this->params.backend_sampling && !cpu_argmax_fastpath) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(MTP_DRAFT_TOP_K));
@@ -1071,6 +1086,8 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
     }
 
     ~common_speculative_state_draft_mtp() override {
+        LOG_INF("{\"record\":\"mtp_cpu_argmax_final\",\"enabled\":%d,\"cpu_argmax_calls\":%" PRIu64 ",\"cpu_topk_calls\":%" PRIu64 ",\"failures\":%" PRIu64 "}\n",
+                (int) cpu_argmax_fastpath, n_cpu_argmax, n_cpu_topk, n_fastpath_fail);
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1330,24 +1347,37 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                const auto * cur_p = common_sampler_sample_top_k_probs(smpl, ctx_dft, i_last[seq_id], MTP_DRAFT_TOP_K);
                 const float * h_row = llama_get_embeddings_pre_norm_ith(ctx_dft, i_last[seq_id]);
-
-                if (log_debug) {
-                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                        LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                llama_token id;
+                if (cpu_argmax_fastpath) {
+                    if (common_speculative_effective_p_min(params, dp) != 0.0f) {
+                        ++n_fastpath_fail;
+                        GGML_ABORT("MTP CPU argmax fast path refuses nonzero effective p_min");
                     }
-                }
-
-                // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
-
-                if (cur_p->data[0].p < common_speculative_effective_p_min(params, dp)) {
-                    drafting[seq_id] = 0;
-                    n_drafting--;
-                    continue;
+                    const float * logits = llama_get_logits_ith(ctx_dft, i_last[seq_id]);
+                    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                    if (logits == nullptr || n_vocab <= 0) {
+                        ++n_fastpath_fail;
+                        GGML_ABORT("MTP CPU argmax fast path could not read logits");
+                    }
+                    id = (llama_token) std::distance(logits, std::max_element(logits, logits + n_vocab));
+                    ++n_cpu_argmax;
+                } else {
+                    const auto * cur_p = common_sampler_sample_top_k_probs(smpl, ctx_dft, i_last[seq_id], MTP_DRAFT_TOP_K);
+                    ++n_cpu_topk;
+                    if (log_debug) {
+                        for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                            LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                    seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+                                    common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                        }
+                    }
+                    id = cur_p->data[0].id;
+                    if (cur_p->data[0].p < common_speculative_effective_p_min(params, dp)) {
+                        drafting[seq_id] = 0;
+                        n_drafting--;
+                        continue;
+                    }
                 }
 
                 common_sampler_accept(smpl, id, true);
