@@ -1073,6 +1073,22 @@ json oaicompat_chat_params_parse(
         throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
     }
 
+    // OpenAI-compatible reasoning effort is a top-level request field. Forward
+    // it to the embedded chat template instead of silently falling back to the
+    // model's default (xhigh for Qwen3.8).
+    if (body.contains("reasoning_effort")) {
+        if (!body.at("reasoning_effort").is_string()) {
+            throw std::invalid_argument("reasoning_effort must be a string");
+        }
+
+        const auto reasoning_effort = body.at("reasoning_effort").get<std::string>();
+        if (reasoning_effort != "xhigh" && reasoning_effort != "medium" && reasoning_effort != "low") {
+            throw std::invalid_argument(
+                "reasoning_effort must be one of \"xhigh\", \"medium\", or \"low\"");
+        }
+        inputs.chat_template_kwargs["reasoning_effort"] = body.at("reasoning_effort").dump();
+    }
+
     // if the assistant message appears at the end of list, we do not add end-of-turn token
     // for ex. this can be useful to modify the reasoning process in reasoning models
     // continue_final_message is the explicit opt in alias from the vLLM/transformers API,
@@ -1155,7 +1171,9 @@ json oaicompat_chat_params_parse(
     llama_params["prompt"]      = chat_params.prompt;
     if (!chat_params.grammar.empty()) {
         llama_params["grammar"]      = chat_params.grammar;
-        llama_params["grammar_type"] = std::string("tool_calls");
+        llama_params["grammar_type"] = !json_schema.is_null()
+            ? std::string("output_format")
+            : (!grammar.empty() ? std::string("user") : std::string("tool_calls"));
     }
     llama_params["grammar_lazy"] = chat_params.grammar_lazy;
     auto grammar_triggers        = json::array();

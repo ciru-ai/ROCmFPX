@@ -947,6 +947,52 @@ static common_chat_params common_chat_params_init_ministral_3(const common_chat_
     return data;
 }
 
+static common_chat_params common_chat_params_init_qwen3_response_format(
+        const common_chat_template &          tmpl,
+        const autoparser::generation_params & inputs) {
+    common_chat_params data;
+
+    const std::string GEN_PREFIX = "<|im_start|>assistant\n";
+
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+    data.generation_prompt = GEN_PREFIX;
+    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+
+    auto supports_reasoning = tmpl.source().find("<think>") != std::string::npos;
+
+    data.supports_thinking = supports_reasoning;
+    if (supports_reasoning) {
+        data.thinking_start_tag = "<think>";
+        data.thinking_end_tag   = "</think>";
+        data.preserved_tokens   = { "<think>", "</think>" };
+    }
+
+    const bool extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+
+    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+        auto generation_prompt = p.literal(GEN_PREFIX);
+
+        auto reasoning = p.eps();
+        if (supports_reasoning && extract_reasoning) {
+            reasoning = p.optional("<think>" + p.space() +
+                                   p.reasoning(p.until("</think>")) +
+                                   p.literal("</think>"));
+        }
+
+        return generation_prompt +
+               (reasoning << p.content(p.schema(p.json(), "response-format", inputs.json_schema)));
+    });
+
+    data.parser = parser.save();
+    data.grammar = build_grammar([&](const common_grammar_builder & builder) {
+        auto schema = inputs.json_schema;
+        builder.resolve_refs(schema);
+        parser.build_grammar(builder, false);
+    });
+
+    return data;
+}
+
 static common_chat_params common_chat_params_init_gpt_oss(const common_chat_template &    tmpl,
                                                           const autoparser::generation_params & inputs) {
     common_chat_params data;
@@ -2136,6 +2182,17 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
             workaround::convert_tool_responses_gemma4(params.messages);
         }
         return common_chat_params_init_gemma4(tmpl, params);
+    }
+
+    // Qwen's tagged-thinking templates need an output-format grammar that starts
+    // only after the optional reasoning block. Tool parsing stays on the existing
+    // v2.2 path; this specialization is deliberately limited to schema responses.
+    if (params.tools.empty() && params.json_schema.is_object() && !params.json_schema.empty() &&
+        src.find("<tool_call>") != std::string::npos &&
+        src.find("<function=") != std::string::npos &&
+        src.find("<parameter=") != std::string::npos) {
+        LOG_DBG("Using specialized template: Qwen3-Coder\n");
+        return common_chat_params_init_qwen3_response_format(tmpl, params);
     }
 
     return std::nullopt;

@@ -405,6 +405,8 @@ task_params server_task::params_from_json_cmpl(
             std::string grammar_type = json_value(data, "grammar_type", std::string());
             if (grammar_type == "tool_calls") {
                 params.sampling.grammar = {COMMON_GRAMMAR_TYPE_TOOL_CALLS, std::move(grammar_str)};
+            } else if (grammar_type == "output_format") {
+                params.sampling.grammar = {COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, std::move(grammar_str)};
             } else {
                 // explicit grammar from the user (API field "grammar")
                 params.sampling.grammar = {COMMON_GRAMMAR_TYPE_USER, std::move(grammar_str)};

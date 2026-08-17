@@ -31,6 +31,10 @@ constexpr int PF_LAYERS = 64;
 constexpr int PF_M = 2048;
 constexpr int PF_CHECKPOINT_M = 2044;
 constexpr int PF_TAIL_M = 1476;
+// Restrict the route to the measured prompt band. Small verification batches
+// remain on compact MMQ because padding them to M128 regresses decode throughput.
+constexpr int PF_SMALLM_MIN = 96;
+constexpr int PF_SMALLM_MAX = 512;
 constexpr int PF_H = 5120;
 constexpr int PF_I = 17408;
 constexpr uint64_t PF_FILE_BYTES = 17123004416ULL;
@@ -102,9 +106,30 @@ constexpr int PF_DOWN_CK_INDEX_M2044 = 20;
 // Validated gfx1151 CK route indices for the 1,476-row prompt tail.
 constexpr int PF_GATE_CK_INDEX_M1476_STAGED = 20;
 constexpr int PF_DOWN_CK_INDEX_M1476_STAGED = 20;
+// Measured M128xN64xK64 winner and its MNKPadding twin.
+constexpr int PF_SMALLM_W8_FIXED_CK_INDEX = 0;
+constexpr int PF_SMALLM_W8_CK_INDEX = 11;
+constexpr int PF_SMALLM_W8_FIXED_ROWS = 128;
 
 enum class PFMode { disabled, resident, m2048, m2048_fused, m2048_fused_tail1476 };
 enum class PFGDNKind { none, qkv, z };
+
+// A row-shaped FFN route cache. Keeping the gate/down pair together avoids
+// duplicating routing and handoff state if another public backend is added.
+struct PFFFNRowRouteCache {
+    int rows = 0;
+    int execution_rows = 0;
+    uint64_t rebuilds = 0;
+    // The fixed gate route reuses PFState::gate_op / gate_invoker (CK index 0).
+    std::unique_ptr<CKDeviceOp> fixed_down_op;
+    std::unique_ptr<ck::tensor_operation::device::BaseInvoker> fixed_down_invoker;
+    std::unique_ptr<CKDeviceOp> gate_op;
+    std::unique_ptr<CKDeviceOp> down_op;
+    std::unique_ptr<ck::tensor_operation::device::BaseInvoker> gate_invoker;
+    std::unique_ptr<ck::tensor_operation::device::BaseInvoker> down_invoker;
+    std::array<std::unique_ptr<ck::tensor_operation::device::BaseArgument>, PF_LAYERS> gate_args;
+    std::array<std::unique_ptr<ck::tensor_operation::device::BaseArgument>, PF_LAYERS> down_args;
+};
 
 struct PFState {
     std::mutex init_mutex;
@@ -115,6 +140,9 @@ struct PFState {
     uint8_t * device_file = nullptr;
     bool gdn_enabled = false;
     uint8_t * gdn_device_file = nullptr;
+    bool smallm_w8_enabled = false;
+    std::mutex smallm_cache_mutex;
+    PFFFNRowRouteCache smallm_w8;
 
     std::array<uint64_t, PF_LAYERS> gate_weight{};
     std::array<uint64_t, PF_LAYERS> gate_scale{};
@@ -174,6 +202,10 @@ struct PFState {
     int gdn_z_write_count = 0;
     int gdn_pair_miss_count = 0;
     int gdn_fallback_count = 0;
+    bool smallm_request = false;
+    int smallm_gate_count = 0;
+    int smallm_down_count = 0;
+    int smallm_fallback_count = 0;
     int pending_gdn_layer = -1;
     int pending_gdn_rows = 0;
     const void * pending_gdn_input = nullptr;
@@ -201,6 +233,37 @@ bool exact_tensor(const ggml_tensor * tensor, ggml_type type, int64_t ne0, int64
 bool exact_shape(const ggml_tensor * tensor, int64_t ne0, int64_t ne1) {
     return tensor && tensor->ne[0] == ne0 && tensor->ne[1] == ne1 &&
            tensor->ne[2] == 1 && tensor->ne[3] == 1 && ggml_is_contiguous(tensor);
+}
+
+bool smallm_rows(int rows) {
+    return rows >= PF_SMALLM_MIN && rows <= PF_SMALLM_MAX;
+}
+
+int smallm_execution_rows(int rows) {
+    return rows <= PF_SMALLM_W8_FIXED_ROWS ? PF_SMALLM_W8_FIXED_ROWS : rows;
+}
+
+int exact_smallm_rows(const ggml_tensor * tensor, ggml_type type, int64_t ne0) {
+    if (!tensor || tensor->type != type || tensor->ne[0] != ne0 ||
+        tensor->ne[1] < PF_SMALLM_MIN || tensor->ne[1] > PF_SMALLM_MAX ||
+        tensor->ne[2] != 1 || tensor->ne[3] != 1 ||
+        !ggml_is_contiguous(tensor)) {
+        return 0;
+    }
+    return int(tensor->ne[1]);
+}
+
+void emit_smallm_fallback(PFState & s, int rows, const char * stage, const char * reason) {
+    if (s.count_active && s.active_rows == rows) {
+        ++s.fallback_count;
+        ++s.smallm_fallback_count;
+    }
+    std::fprintf(stderr,
+        "{\"record\":\"promptforge_smallm_fallback\",\"rows\":%d,"
+        "\"execution_rows\":%d,\"stage\":\"%s\",\"reason\":\"%s\"}\n",
+        rows, smallm_execution_rows(rows),
+        stage, reason);
+    std::fflush(stderr);
 }
 
 int exact_layer(const ggml_tensor * weight, const char * suffix) {
@@ -231,6 +294,8 @@ void begin_request_if_needed(PFState & s, int rows) {
         s.gdn_qkvz_count = s.gdn_pack_count = 0;
         s.gdn_qkv_write_count = s.gdn_z_write_count = 0;
         s.gdn_pair_miss_count = s.gdn_fallback_count = 0;
+        s.smallm_request = s.smallm_w8_enabled && smallm_rows(rows);
+        s.smallm_gate_count = s.smallm_down_count = s.smallm_fallback_count = 0;
         s.active_rows = rows;
         return;
     }
@@ -252,11 +317,19 @@ void emit_request_telemetry(PFState & s) {
         "\"packs\":%d,\"fallback\":%d,\"fused_down_pack\":%d,"
         "\"gdn_qkvz\":%d,\"gdn_packs\":%d,\"gdn_qkv_writes\":%d,"
         "\"gdn_z_writes\":%d,\"gdn_pair_miss\":%d,\"gdn_fallback\":%d,"
-        "\"gdn_projection\":\"qkvz_w8\",\"rows\":%d}\n",
+        "\"gdn_projection\":\"qkvz_w8\",\"rows\":%d,"
+        "\"smallm_w8\":%s,\"smallm_rows\":%d,\"smallm_execution_rows\":%d,"
+        "\"smallm_gate_up\":%d,"
+        "\"smallm_down\":%d,\"smallm_fallback\":%d,"
+        "\"smallm_cache_rebuilds\":%llu}\n",
         s.gate_count, s.down_count, s.pack_count, s.fallback_count,
         s.fused_down_pack_count, s.gdn_qkvz_count, s.gdn_pack_count,
         s.gdn_qkv_write_count, s.gdn_z_write_count, s.gdn_pair_miss_count,
-        s.gdn_fallback_count, s.active_rows);
+        s.gdn_fallback_count, s.active_rows,
+        s.smallm_request ? "true" : "false", s.smallm_request ? s.active_rows : 0,
+        s.smallm_request ? s.smallm_w8.execution_rows : 0,
+        s.smallm_gate_count, s.smallm_down_count, s.smallm_fallback_count,
+        (unsigned long long) s.smallm_w8.rebuilds);
     std::fflush(stderr);
     s.count_active = false;
 }
@@ -516,6 +589,73 @@ bool allocate_scratch(PFState & s) {
            hip_check(hipMalloc(&s.down_out, size_t(PF_M) * PF_H * sizeof(__hip_bfloat16)), "hipMalloc(down_out)");
 }
 
+bool ensure_smallm_w8_cache(PFState & s, int rows) {
+    const bool fixed_bucket = rows <= PF_SMALLM_W8_FIXED_ROWS;
+    const int execution_rows = smallm_execution_rows(rows);
+    if (!s.smallm_w8_enabled || !smallm_rows(rows) ||
+        (fixed_bucket && (!s.gate_op || !s.smallm_w8.fixed_down_op)) ||
+        (!fixed_bucket && (!s.smallm_w8.gate_op || !s.smallm_w8.down_op))) {
+        return false;
+    }
+    if (s.smallm_w8.execution_rows == execution_rows &&
+        s.smallm_w8.gate_args[0] && s.smallm_w8.down_args[0]) {
+        s.smallm_w8.rows = rows;
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(s.smallm_cache_mutex);
+    if (s.smallm_w8.execution_rows == execution_rows &&
+        s.smallm_w8.gate_args[0] && s.smallm_w8.down_args[0]) {
+        s.smallm_w8.rows = rows;
+        return true;
+    }
+
+    CKDeviceOp * gate_op = fixed_bucket ? s.gate_op.get() : s.smallm_w8.gate_op.get();
+    CKDeviceOp * down_op = fixed_bucket ? s.smallm_w8.fixed_down_op.get() : s.smallm_w8.down_op.get();
+    const int ck_index = fixed_bucket ? PF_SMALLM_W8_FIXED_CK_INDEX : PF_SMALLM_W8_CK_INDEX;
+    std::array<std::unique_ptr<ck::tensor_operation::device::BaseArgument>, PF_LAYERS> gate_args;
+    std::array<std::unique_ptr<ck::tensor_operation::device::BaseArgument>, PF_LAYERS> down_args;
+    for (int layer = 0; layer < PF_LAYERS; ++layer) {
+        auto gate_arg = gate_op->MakeArgumentPointer(
+            s.gate_a8, s.device_file + s.gate_weight[layer],
+            std::array<const void *, 2>{s.device_file + s.gate_scale[layer], s.gate_a_scale}, s.gate_out,
+            execution_rows, 2 * PF_I, PF_H, PF_H, PF_H,
+            std::array<ck::index_t, 2>{0, 0}, 2 * PF_I, 1,
+            PassThrough{}, PassThrough{}, MultiplyMultiply{});
+        auto down_arg = down_op->MakeArgumentPointer(
+            s.down_a8, s.device_file + s.down_weight[layer],
+            std::array<const void *, 2>{s.device_file + s.down_scale[layer], s.down_a_scale}, s.down_out,
+            execution_rows, PF_H, PF_I, PF_I, PF_I,
+            std::array<ck::index_t, 2>{0, 0}, PF_H, 1,
+            PassThrough{}, PassThrough{}, MultiplyMultiply{});
+        if (!gate_op->IsSupportedArgument(gate_arg.get()) ||
+            !down_op->IsSupportedArgument(down_arg.get())) {
+            std::fprintf(stderr,
+                "{\"record\":\"promptforge_smallm_cache\",\"ready\":false,"
+                "\"rows\":%d,\"execution_rows\":%d,\"layer\":%d,\"ck_index\":%d}\n",
+                rows, execution_rows, layer, ck_index);
+            std::fflush(stderr);
+            return false;
+        }
+        gate_args[layer] = std::move(gate_arg);
+        down_args[layer] = std::move(down_arg);
+    }
+
+    s.smallm_w8.gate_args = std::move(gate_args);
+    s.smallm_w8.down_args = std::move(down_args);
+    s.smallm_w8.rows = rows;
+    s.smallm_w8.execution_rows = execution_rows;
+    ++s.smallm_w8.rebuilds;
+    std::fprintf(stderr,
+        "{\"record\":\"promptforge_smallm_cache\",\"ready\":true,"
+        "\"rows\":%d,\"execution_rows\":%d,\"gate_args\":%d,\"down_args\":%d,"
+        "\"ck_index\":%d,\"rebuild\":%llu}\n",
+        rows, execution_rows, PF_LAYERS, PF_LAYERS, ck_index,
+        (unsigned long long) s.smallm_w8.rebuilds);
+    std::fflush(stderr);
+    return true;
+}
+
 bool build_routes(PFState & s) {
     std::vector<std::unique_ptr<CKDeviceOp>> gate_ops;
     std::vector<std::unique_ptr<CKDeviceOp>> down_ops;
@@ -523,12 +663,22 @@ bool build_routes(PFState & s) {
         add_device_gemm_multiply_multiply_wmma_c_shuffle_i8_i8_bf16_km_nk_mn_instances(gate_ops);
     ck::tensor_operation::device::instance::
         add_device_gemm_multiply_multiply_wmma_c_shuffle_i8_i8_bf16_km_nk_mn_instances(down_ops);
-    if (gate_ops.size() <= PF_GATE_CK_INDEX_M2048 || down_ops.size() <= PF_DOWN_CK_INDEX_M2048) {
+    if (gate_ops.size() <= PF_GATE_CK_INDEX_M2048 || down_ops.size() <= PF_DOWN_CK_INDEX_M2048 ||
+        (s.smallm_w8_enabled && (gate_ops.size() <= PF_SMALLM_W8_CK_INDEX ||
+                                down_ops.size() <= PF_SMALLM_W8_CK_INDEX))) {
         std::fprintf(stderr, "promptforge: required CK indices absent\n");
         return false;
     }
     s.gate_op = std::move(gate_ops[PF_GATE_CK_INDEX_M2048]);
     s.down_op = std::move(down_ops[PF_DOWN_CK_INDEX_M2048]);
+    if (s.smallm_w8_enabled) {
+        s.smallm_w8.fixed_down_op = std::move(down_ops[PF_SMALLM_W8_FIXED_CK_INDEX]);
+        s.smallm_w8.gate_op = std::move(gate_ops[PF_SMALLM_W8_CK_INDEX]);
+        s.smallm_w8.down_op = std::move(down_ops[PF_SMALLM_W8_CK_INDEX]);
+        s.smallm_w8.fixed_down_invoker = s.smallm_w8.fixed_down_op->MakeInvokerPointer();
+        s.smallm_w8.gate_invoker = s.smallm_w8.gate_op->MakeInvokerPointer();
+        s.smallm_w8.down_invoker = s.smallm_w8.down_op->MakeInvokerPointer();
+    }
     for (int layer = 0; layer < PF_LAYERS; ++layer) {
         auto gate_arg = s.gate_op->MakeArgumentPointer(
             s.gate_a8, s.device_file + s.gate_weight[layer],
@@ -636,6 +786,15 @@ bool build_routes(PFState & s) {
             s.mode == PFMode::m2048_fused ? "m2048_fused" : "resident",
             (unsigned long long) PF_FILE_BYTES);
     }
+    std::fprintf(stderr,
+        "{\"record\":\"promptforge_smallm_init\",\"enabled\":%s,"
+        "\"min_rows\":%d,\"max_rows\":%d,\"fixed_max_rows\":%d,"
+        "\"fixed_execution_rows\":%d,\"fixed_ck_index\":%d,\"padded_ck_index\":%d,"
+        "\"scope\":\"ffn_gate_up_down\",\"cache\":\"lazy_execution_rows\"}\n",
+        s.smallm_w8_enabled ? "true" : "false", PF_SMALLM_MIN, PF_SMALLM_MAX,
+        PF_SMALLM_W8_FIXED_ROWS, PF_SMALLM_W8_FIXED_ROWS,
+        PF_SMALLM_W8_FIXED_CK_INDEX, PF_SMALLM_W8_CK_INDEX);
+    std::fflush(stderr);
     return true;
 }
 
@@ -714,7 +873,13 @@ void run_gate(PFState & s, int layer, const float * input, float * output, hipSt
 void run_gate_fused(PFState & s, int layer, int rows, const float * input, hipStream_t stream) {
     hipLaunchKernelGGL(dynamic_a8_pack, dim3(rows), dim3(256), 0, stream,
                        input, s.gate_a8, s.gate_a_scale, rows, PF_H);
-    if (rows == PF_TAIL_M) {
+    if (s.smallm_w8_enabled && smallm_rows(rows)) {
+        if (s.smallm_w8.execution_rows == PF_SMALLM_W8_FIXED_ROWS) {
+            s.gate_invoker->Run(s.smallm_w8.gate_args[layer].get(), ::StreamConfig{stream, false});
+        } else {
+            s.smallm_w8.gate_invoker->Run(s.smallm_w8.gate_args[layer].get(), ::StreamConfig{stream, false});
+        }
+    } else if (rows == PF_TAIL_M) {
         s.gate_tail1476_invoker->Run(s.gate_tail1476_args[layer].get(), ::StreamConfig{stream, false});
     } else if (rows == PF_CHECKPOINT_M) {
         s.gate_checkpoint2044_invoker->Run(s.gate_checkpoint2044_args[layer].get(), ::StreamConfig{stream, false});
@@ -735,7 +900,13 @@ void run_down(PFState & s, int layer, const float * input, float * output, hipSt
 }
 
 void run_down_fused(PFState & s, int layer, int rows, float * output, hipStream_t stream) {
-    if (rows == PF_TAIL_M) {
+    if (s.smallm_w8_enabled && smallm_rows(rows)) {
+        if (s.smallm_w8.execution_rows == PF_SMALLM_W8_FIXED_ROWS) {
+            s.smallm_w8.fixed_down_invoker->Run(s.smallm_w8.down_args[layer].get(), ::StreamConfig{stream, false});
+        } else {
+            s.smallm_w8.down_invoker->Run(s.smallm_w8.down_args[layer].get(), ::StreamConfig{stream, false});
+        }
+    } else if (rows == PF_TAIL_M) {
         s.down_tail1476_invoker->Run(s.down_tail1476_args[layer].get(), ::StreamConfig{stream, false});
     } else if (rows == PF_CHECKPOINT_M) {
         s.down_checkpoint2044_invoker->Run(s.down_checkpoint2044_args[layer].get(), ::StreamConfig{stream, false});
@@ -779,6 +950,13 @@ bool promptforge_backend_init(int device) {
         return s.ready && ((s.mode == PFMode::disabled && !s.gdn_enabled) || s.device == device);
     }
     s.initialized = true;
+    const char * smallm_w8 = std::getenv("PROMPTFORGE_ENABLE_SMALLM_W8");
+    if (smallm_w8 && smallm_w8[0] && std::strcmp(smallm_w8, "0") != 0 &&
+        std::strcmp(smallm_w8, "1") != 0) {
+        std::fprintf(stderr, "promptforge: PROMPTFORGE_ENABLE_SMALLM_W8 must be 0 or 1\n");
+        return false;
+    }
+    s.smallm_w8_enabled = smallm_w8 && std::strcmp(smallm_w8, "1") == 0;
     const char * gdn_sidecar = std::getenv("PROMPTFORGE_GDN_SIDECAR");
     s.gdn_enabled = gdn_sidecar && gdn_sidecar[0];
     const char * graph_opt = std::getenv("GGML_CUDA_GRAPH_OPT");
@@ -789,7 +967,7 @@ bool promptforge_backend_init(int device) {
     const char * mode = std::getenv("PROMPTFORGE_MODE");
     if (!mode || !mode[0]) {
         s.mode = PFMode::disabled;
-        if (!s.gdn_enabled) {
+        if (!s.gdn_enabled && !s.smallm_w8_enabled) {
             s.ready = true;
             return true;
         }
@@ -805,9 +983,17 @@ bool promptforge_backend_init(int device) {
         std::fprintf(stderr, "promptforge: PROMPTFORGE_MODE must be resident, m2048, m2048_fused, or m2048_fused_tail1476\n");
         return false;
     }
+    if (!smallm_w8 && s.mode != PFMode::disabled) {
+        s.smallm_w8_enabled = true;
+    }
     const char * sidecar = std::getenv("PROMPTFORGE_SIDECAR");
     if (s.mode != PFMode::disabled && (!sidecar || !sidecar[0])) {
         std::fprintf(stderr, "promptforge: PROMPTFORGE_SIDECAR is required\n");
+        return false;
+    }
+    if (s.smallm_w8_enabled && s.mode == PFMode::disabled) {
+        std::fprintf(stderr,
+            "promptforge: PROMPTFORGE_ENABLE_SMALLM_W8=1 requires PROMPTFORGE_MODE and PROMPTFORGE_SIDECAR\n");
         return false;
     }
     s.device = device;
@@ -903,17 +1089,22 @@ bool promptforge_try_gdn_qkvz(ggml_backend_cuda_context * ctx,
 bool promptforge_try_fuse_gate_up(ggml_backend_cuda_context * ctx,
                                   ggml_tensor * first, ggml_tensor * second, ggml_tensor * glu) {
     PFState & s = state();
-    const bool fused = s.mode == PFMode::m2048_fused || s.mode == PFMode::m2048_fused_tail1476;
-    if (!s.ready || (s.mode != PFMode::m2048 && !fused) || !ctx || !glu ||
+    const bool large_fused = s.mode == PFMode::m2048_fused || s.mode == PFMode::m2048_fused_tail1476;
+    const bool large_enabled = s.mode == PFMode::m2048 || large_fused;
+    if (!s.ready || (!large_enabled && !s.smallm_w8_enabled) || !ctx || !glu ||
         ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0) {
         return false;
     }
-    const int rows = exact_tensor(glu, GGML_TYPE_F32, PF_I, PF_M) ? PF_M :
+    const int dynamic_smallm_rows = s.smallm_w8_enabled ? exact_smallm_rows(glu, GGML_TYPE_F32, PF_I) : 0;
+    const int rows = large_enabled && exact_tensor(glu, GGML_TYPE_F32, PF_I, PF_M) ? PF_M :
                      s.mode == PFMode::m2048_fused_tail1476 &&
                      exact_tensor(glu, GGML_TYPE_F32, PF_I, PF_CHECKPOINT_M) ? PF_CHECKPOINT_M :
                      s.mode == PFMode::m2048_fused_tail1476 &&
-                     exact_tensor(glu, GGML_TYPE_F32, PF_I, PF_TAIL_M) ? PF_TAIL_M : 0;
+                     exact_tensor(glu, GGML_TYPE_F32, PF_I, PF_TAIL_M) ? PF_TAIL_M :
+                     dynamic_smallm_rows;
     if (rows == 0) return false;
+    const bool use_smallm = dynamic_smallm_rows != 0 && rows == dynamic_smallm_rows;
+    const bool fused = large_fused || use_smallm;
     ggml_tensor * gate = nullptr;
     ggml_tensor * up = nullptr;
     int layer = exact_layer(first ? first->src[0] : nullptr, "ffn_gate.weight");
@@ -923,6 +1114,7 @@ bool promptforge_try_fuse_gate_up(ggml_backend_cuda_context * ctx,
     } else {
         layer = exact_layer(second ? second->src[0] : nullptr, "ffn_gate.weight");
         if (layer < 0 || exact_layer(first ? first->src[0] : nullptr, "ffn_up.weight") != layer) {
+            if (use_smallm) emit_smallm_fallback(s, rows, "gate_up", "weight_pair");
             return false;
         }
         gate = second;
@@ -931,7 +1123,12 @@ bool promptforge_try_fuse_gate_up(ggml_backend_cuda_context * ctx,
     if (!gate || !up || gate->op != GGML_OP_MUL_MAT || up->op != GGML_OP_MUL_MAT ||
         gate->src[1] != up->src[1] || !exact_tensor(gate->src[1], GGML_TYPE_F32, PF_H, rows) ||
         !exact_tensor(gate, GGML_TYPE_F32, PF_I, rows) || !exact_tensor(up, GGML_TYPE_F32, PF_I, rows) ||
-        !((glu->src[0] == gate && glu->src[1] == up) || (glu->src[0] == up && glu->src[1] == gate))) {
+         !((glu->src[0] == gate && glu->src[1] == up) || (glu->src[0] == up && glu->src[1] == gate))) {
+        if (use_smallm) emit_smallm_fallback(s, rows, "gate_up", "tensor_shape");
+        return false;
+    }
+    if (use_smallm && !ensure_smallm_w8_cache(s, rows)) {
+        emit_smallm_fallback(s, rows, "gate_up", "cache_unavailable");
         return false;
     }
     if (fused && s.pending_down_input) {
@@ -955,6 +1152,9 @@ bool promptforge_try_fuse_gate_up(ggml_backend_cuda_context * ctx,
     }
     if (s.count_active) {
         ++s.gate_count;
+        if (use_smallm) {
+            ++s.smallm_gate_count;
+        }
         if (fused) {
             s.pack_count += 2;
             ++s.fused_down_pack_count;
@@ -968,19 +1168,64 @@ bool promptforge_try_fuse_gate_up(ggml_backend_cuda_context * ctx,
 bool promptforge_try_down(ggml_backend_cuda_context * ctx,
                           const ggml_tensor * weight, const ggml_tensor * input, ggml_tensor * dst) {
     PFState & s = state();
-    const bool fused = s.mode == PFMode::m2048_fused || s.mode == PFMode::m2048_fused_tail1476;
-    if (!s.ready || (s.mode != PFMode::m2048 && !fused)) {
+    const bool large_fused = s.mode == PFMode::m2048_fused || s.mode == PFMode::m2048_fused_tail1476;
+    const bool large_enabled = s.mode == PFMode::m2048 || large_fused;
+    if (!s.ready || (!large_enabled && !s.smallm_w8_enabled)) {
         return false;
     }
     if (!ctx) {
-        if (fused && s.pending_down_input) {
+        if (s.pending_down_input) {
             std::fprintf(stderr, "promptforge: fused down handoff has no CUDA context\n");
             std::abort();
         }
         return false;
     }
     const int layer = exact_layer(weight, "ffn_down.weight");
-    const int rows = exact_tensor(input, GGML_TYPE_F32, PF_I, PF_M) &&
+
+    // A successful fused gate intentionally leaves `input` unmaterialized. Once
+    // that handoff is pending, falling back is never valid: either this is the
+    // exact paired down projection or the process stops before consuming garbage.
+    if (s.pending_down_input) {
+        const int rows = s.pending_down_rows;
+        const bool use_smallm = s.smallm_w8_enabled && smallm_rows(rows);
+        const bool exact_down = layer >= 0 &&
+                                exact_tensor(input, GGML_TYPE_F32, PF_I, rows) &&
+                                exact_tensor(dst, GGML_TYPE_F32, PF_H, rows);
+        if (!exact_down || input != s.pending_down_input || layer != s.pending_down_layer) {
+            if (use_smallm) emit_smallm_fallback(s, rows, "down", "handoff_mismatch");
+            std::fprintf(stderr,
+                "promptforge: fused down handoff mismatch (pending layer %d rows %d, requested layer %d)\n",
+                s.pending_down_layer, rows, layer);
+            std::abort();
+        }
+        if (use_smallm) {
+            const int expected_execution_rows = smallm_execution_rows(rows);
+            if (s.smallm_w8.execution_rows != expected_execution_rows ||
+                !s.smallm_w8.gate_args[layer] || !s.smallm_w8.down_args[layer]) {
+                emit_smallm_fallback(s, rows, "down", "cache_changed_after_gate");
+                std::abort();
+            }
+        }
+        run_down_fused(s, layer, rows, static_cast<float *>(dst->data), ctx->stream());
+        if (s.count_active) {
+            ++s.down_count;
+            if (use_smallm) {
+                ++s.smallm_down_count;
+            }
+            if (layer == PF_LAYERS - 1) {
+                emit_request_telemetry(s);
+            }
+        }
+        return true;
+    }
+
+    // Without a pending fused handoff, small-M and fused-large down projections
+    // must remain on the ordinary graph path. Only legacy non-fused M2048 is
+    // eligible for the standalone PromptForge down route here.
+    if (large_fused || s.mode != PFMode::m2048) {
+        return false;
+    }
+    const int rows = large_enabled && exact_tensor(input, GGML_TYPE_F32, PF_I, PF_M) &&
                      exact_tensor(dst, GGML_TYPE_F32, PF_H, PF_M) ? PF_M :
                      s.mode == PFMode::m2048_fused_tail1476 &&
                      exact_tensor(input, GGML_TYPE_F32, PF_I, PF_CHECKPOINT_M) &&
@@ -989,28 +1234,13 @@ bool promptforge_try_down(ggml_backend_cuda_context * ctx,
                      exact_tensor(input, GGML_TYPE_F32, PF_I, PF_TAIL_M) &&
                      exact_tensor(dst, GGML_TYPE_F32, PF_H, PF_TAIL_M) ? PF_TAIL_M : 0;
     const bool exact_down = layer >= 0 && rows != 0;
-    if (fused) {
-        if (!s.pending_down_input) {
-            return false;
-        }
-        if (!exact_down || input != s.pending_down_input || layer != s.pending_down_layer ||
-            rows != s.pending_down_rows) {
-            std::fprintf(stderr,
-                "promptforge: fused down handoff mismatch (pending layer %d, requested layer %d)\n",
-                s.pending_down_layer, layer);
-            std::abort();
-        }
-        run_down_fused(s, layer, rows, static_cast<float *>(dst->data), ctx->stream());
-    } else if (!exact_down) {
+    if (!exact_down) {
         return false;
-    } else {
-        run_down(s, layer, static_cast<const float *>(input->data), static_cast<float *>(dst->data), ctx->stream());
     }
+    run_down(s, layer, static_cast<const float *>(input->data), static_cast<float *>(dst->data), ctx->stream());
     if (s.count_active) {
         ++s.down_count;
-        if (s.mode == PFMode::m2048) {
-            ++s.pack_count;
-        }
+        ++s.pack_count;
         if (layer == PF_LAYERS - 1) {
             emit_request_telemetry(s);
         }
