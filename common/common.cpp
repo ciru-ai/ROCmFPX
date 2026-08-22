@@ -1260,8 +1260,11 @@ common_init_result::common_init_result(common_params & params) :
     }
 
     // [TAG_RS_STATE_ROLLBACK_SUPPORT]
-    // TODO: ngram speculative methods require checkpointing in addition to partial RS rollback
-    //       currently this is not supported. so we disable the partial rollback
+    // N-gram drafts can exceed the bounded recurrent rollback window.  The server
+    // now creates a full checkpoint only for those actual drafts; keeping RS
+    // enabled avoids checkpointing every short MTP fallback in a combined setup.
+    const char * ngram_rs_env = std::getenv("LLAMA_SPEC_NGRAM_RS_ROLLBACK");
+    const bool allow_ngram_mod_rs = ngram_rs_env != nullptr && std::strcmp(ngram_rs_env, "1") == 0;
     if (cparams.n_rs_seq > 0 && (llama_model_is_recurrent(model) || llama_model_is_hybrid(model))) {
         auto & types = params.speculative.types;
 
@@ -1270,6 +1273,10 @@ common_init_result::common_init_result(common_params & params) :
                 continue;
             }
             if (types[i] == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+                continue;
+            }
+            if (types[i] == COMMON_SPECULATIVE_TYPE_NGRAM_MOD && allow_ngram_mod_rs) {
+                LOG_INF("%s: keeping bounded recurrent rollback for ngram-mod; long drafts use checkpoints\n", __func__);
                 continue;
             }
 

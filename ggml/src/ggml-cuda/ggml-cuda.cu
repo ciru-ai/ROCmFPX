@@ -61,6 +61,7 @@
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
 #include "ggml-cuda/promptforge.cuh"
+#include "ggml-cuda/promptforge_output_k8.cuh"
 #include "ggml-cuda/solve_tri.cuh"
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
@@ -2632,7 +2633,13 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (promptforge_try_output_k8_strict_greedy(&ctx, src0, src1, dst)) {
+        return;
+    }
     if (promptforge_try_gdn_qkvz(&ctx, src0, src1, dst)) {
+        return;
+    }
+    if (promptforge_try_gdn_output(&ctx, src0, src1, dst)) {
         return;
     }
     if (promptforge_try_down(&ctx, src0, src1, dst)) {
@@ -5987,6 +5994,12 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
 
     if (!promptforge_backend_init(device)) {
         GGML_LOG_ERROR("%s: PromptForge initialization failed\n", __func__);
+        delete cuda_backend;
+        delete ctx;
+        return nullptr;
+    }
+    if (!promptforge_output_k8_backend_init(device)) {
+        GGML_LOG_ERROR("%s: PromptForge output K8 initialization failed\n", __func__);
         delete cuda_backend;
         delete ctx;
         return nullptr;

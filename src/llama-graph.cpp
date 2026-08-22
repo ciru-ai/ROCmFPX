@@ -917,6 +917,7 @@ void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
+    t_greedy_argmax = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
 
@@ -954,6 +955,9 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);
+    }
+    if (t_greedy_argmax != nullptr) {
+        ggml_set_output(t_greedy_argmax);
     }
     if (t_embd != nullptr) {
         ggml_set_output(t_embd);
@@ -3087,6 +3091,14 @@ void llm_graph_context::build_pooling(
 }
 
 void llm_graph_context::build_sampling() const {
+    const char * greedy_argmax = getenv("LLAMA_TARGET_GREEDY_ARGMAX_FASTPATH");
+    if (greedy_argmax && strcmp(greedy_argmax, "1") == 0 &&
+        samplers.empty() && res->t_logits) {
+        res->t_greedy_argmax = ggml_argmax(ctx0, res->t_logits);
+        ggml_set_name(res->t_greedy_argmax, "result_greedy_argmax");
+        ggml_build_forward_expand(gf, res->t_greedy_argmax);
+    }
+
     if (samplers.empty() || !res->t_logits) {
         return;
     }

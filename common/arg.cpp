@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
+#include <cstdlib>
 #include <cstdarg>
 #include <fstream>
 #include <list>
@@ -4158,6 +4159,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.port = 8014;
             params.n_ctx = 0;
             params.use_jinja = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--kairic-edge"},
+        "enable the qualified KAIRIC EDGE serving path",
+        [](common_params & params) {
+            params.speculative.kairic_edge = true;
+            auto & types = params.speculative.types;
+            types.erase(std::remove(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_NONE), types.end());
+            if (std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_NGRAM_MOD) == types.end()) {
+                types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
+            }
+            params.speculative.ngram_mod.n_match = 24;
+            params.speculative.ngram_mod.n_min = 64;
+            params.speculative.ngram_mod.n_max = 64;
+
+            setenv("LLAMA_SPEC_NGRAM_RS_ROLLBACK", "1", 1);
+            setenv("PROMPTFORGE_ENABLE_NGRAM_MOD", "1", 1);
+            setenv("PROMPTFORGE_ENABLE_NGRAM_M65_IU4", "1", 1);
+
+            fprintf(stderr, "Kairic Edge: enabled\n");
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 

@@ -16,6 +16,29 @@ instructions by default.
 > Status: experimental research build. Results are hardware-, driver-, model-,
 > and prompt-sensitive. Use BF16/F16 sources for real quality tests.
 
+## Kairic Edge: accelerated IU4 for Qwen3.8-27B
+
+This release contains **Kairic.ai's first accelerated IU4 lane for AMD Strix
+Halo `gfx1151`**. It connects selected packed U4×S4 model operations to AMD's
+native RDNA 3.5 IU4 matrix instruction and ships the qualified Prompt Forge /
+Dual View runtime for **Qwen3.8-27B IU4 Kairic Edge**.
+
+- Model card and artifacts:
+  [jcbtc/Qwen3.8-27B-IU4-Kairic-Edge](https://huggingface.co/jcbtc/Qwen3.8-27B-IU4-Kairic-Edge)
+- Build and verification:
+  [`docs/kairic-edge-gfx1151.md`](docs/kairic-edge-gfx1151.md)
+- Known-best runner:
+  [`scripts/run-kairic-edge-gfx1151.sh`](scripts/run-kairic-edge-gfx1151.sh)
+- Native Composable Kernel patch:
+  [`patches/composable-kernel-gfx1151-iu4.patch`](patches/composable-kernel-gfx1151-iu4.patch)
+
+The bundled runner enables `--kairic-edge` by default together with Prompt
+Forge's phase-specialized Dual View sidecars, the qualified one-slot 256K
+configuration, prompt caching, 32 context checkpoints, F16 target/draft KV,
+and an explicit four-token MTP path. Kairic Edge is a
+scoped hybrid prompt and verification accelerator; it is not a claim that
+every model operation or M1 target-decode token runs natively at four bits.
+
 ## What Is ROCmFPX?
 
 ROCmFPX is a family of GGUF model-weight quants:

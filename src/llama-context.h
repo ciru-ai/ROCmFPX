@@ -328,6 +328,9 @@ private:
 
     sampling_info sampling;
 
+    uint64_t greedy_argmax_batches = 0;
+    uint64_t greedy_argmax_rows = 0;
+
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
     std::map<llama_seq_id, std::vector<float>> embd_seq;

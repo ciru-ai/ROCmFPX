@@ -1354,13 +1354,18 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
                         ++n_fastpath_fail;
                         GGML_ABORT("MTP CPU argmax fast path refuses nonzero effective p_min");
                     }
-                    const float * logits = llama_get_logits_ith(ctx_dft, i_last[seq_id]);
-                    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
-                    if (logits == nullptr || n_vocab <= 0) {
-                        ++n_fastpath_fail;
-                        GGML_ABORT("MTP CPU argmax fast path could not read logits");
+                    id = llama_get_sampled_token_ith(ctx_dft, i_last[seq_id]);
+                    if (id == LLAMA_TOKEN_NULL) {
+                        const float * logits = llama_get_logits_ith(ctx_dft, i_last[seq_id]);
+                        const int32_t n_vocab = llama_vocab_n_tokens(
+                            llama_model_get_vocab(llama_get_model(ctx_dft)));
+                        if (logits == nullptr || n_vocab <= 0) {
+                            ++n_fastpath_fail;
+                            GGML_ABORT("MTP argmax fast path could not read a winner");
+                        }
+                        id = (llama_token) std::distance(
+                            logits, std::max_element(logits, logits + n_vocab));
                     }
-                    id = (llama_token) std::distance(logits, std::max_element(logits, logits + n_vocab));
                     ++n_cpu_argmax;
                 } else {
                     const auto * cur_p = common_sampler_sample_top_k_probs(smpl, ctx_dft, i_last[seq_id], MTP_DRAFT_TOP_K);

@@ -58,6 +58,23 @@
 #define GGML_ROCMFPX_RDNA35_NWARPS 1
 #endif
 
+#ifndef GGML_Q8_0_RDNA35_NWARPS
+#define GGML_Q8_0_RDNA35_NWARPS 1
+#endif
+
+#if GGML_Q8_0_RDNA35_NWARPS != 1 && GGML_Q8_0_RDNA35_NWARPS != 2 && \
+    GGML_Q8_0_RDNA35_NWARPS != 4 && GGML_Q8_0_RDNA35_NWARPS != 8
+#error "GGML_Q8_0_RDNA35_NWARPS must be one of: 1, 2, 4, 8"
+#endif
+
+#ifndef GGML_Q8_0_RDNA35_NWARPS_MAX_NCOLS
+#define GGML_Q8_0_RDNA35_NWARPS_MAX_NCOLS 8
+#endif
+
+#if GGML_Q8_0_RDNA35_NWARPS_MAX_NCOLS < 1 || GGML_Q8_0_RDNA35_NWARPS_MAX_NCOLS > MMVQ_MAX_BATCH_SIZE
+#error "GGML_Q8_0_RDNA35_NWARPS_MAX_NCOLS must be between 1 and MMVQ_MAX_BATCH_SIZE"
+#endif
+
 #if GGML_ROCMFPX_RDNA35_NWARPS != 1 && GGML_ROCMFPX_RDNA35_NWARPS != 2 && \
     GGML_ROCMFPX_RDNA35_NWARPS != 4 && GGML_ROCMFPX_RDNA35_NWARPS != 8
 #error "GGML_ROCMFPX_RDNA35_NWARPS must be one of: 1, 2, 4, 8"
@@ -552,6 +569,11 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     if (table_id == MMVQ_PARAMETERS_RDNA3_5) {
         if (ncols_dst >= 1 && ncols_dst <= GGML_ROCMFP4_RDNA35_NWARPS_MAX_NCOLS) {
             switch (type) {
+                case GGML_TYPE_Q8_0:
+                    if (ncols_dst <= GGML_Q8_0_RDNA35_NWARPS_MAX_NCOLS) {
+                        return GGML_Q8_0_RDNA35_NWARPS;
+                    }
+                    return 1;
                 case GGML_TYPE_Q4_0_ROCMFP4:
                 case GGML_TYPE_Q4_0_ROCMFP4_FAST:
                     return GGML_ROCMFP4_RDNA35_NWARPS;

@@ -35,6 +35,11 @@ struct src_mctx_reset_on_exit {
     llama_memory_context_ptr * slot;
     ~src_mctx_reset_on_exit() { if (slot) slot->reset(); }
 };
+
+bool target_greedy_argmax_enabled() {
+    const char * value = getenv("LLAMA_TARGET_GREEDY_ARGMAX_FASTPATH");
+    return value && strcmp(value, "1") == 0;
+}
 }
 
 llama_context::llama_context(
@@ -437,6 +442,12 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (target_greedy_argmax_enabled()) {
+        LLAMA_LOG_INFO(
+            "{\"record\":\"exact_q8_greedy_argmax_final\","
+            "\"batches\":%" PRIu64 ",\"rows\":%" PRIu64 "}\n",
+            greedy_argmax_batches, greedy_argmax_rows);
+    }
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -1972,6 +1983,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //}
 
         auto * t_logits        = res->get_logits();
+        auto * t_greedy_argmax = res->get_greedy_argmax();
         auto * t_embd          = cparams.embeddings          ? res->get_embd()        : nullptr;
         auto * t_h_pre_norm    = cparams.embeddings_pre_norm ? res->get_h_pre_norm()  : nullptr;
 
@@ -1980,7 +1992,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        if (logits.data && t_logits && !t_greedy_argmax && n_outputs > 0 &&
+            needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -1992,6 +2005,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
             }
+        }
+
+        if (t_greedy_argmax && n_outputs > 0) {
+            ggml_backend_t backend_argmax =
+                ggml_backend_sched_get_tensor_backend(sched.get(), t_greedy_argmax);
+            GGML_ASSERT(backend_argmax != nullptr);
+            GGML_ASSERT(sampling.sampled.has_data());
+            GGML_ASSERT(n_outputs_prev + n_outputs <= (int64_t) sampling.sampled.size);
+            ggml_backend_tensor_get_async(
+                backend_argmax, t_greedy_argmax,
+                sampling.sampled.data + n_outputs_prev, 0,
+                n_outputs * sizeof(llama_token));
+            ++greedy_argmax_batches;
+            greedy_argmax_rows += n_outputs;
         }
 
         // extract embeddings
@@ -2163,7 +2190,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_embd_out = hparams.n_embd_out();
     const auto n_embd     = hparams.n_embd;
 
-    bool has_logits        = true;
+    const bool has_greedy_argmax = target_greedy_argmax_enabled();
+    bool has_logits        = !has_greedy_argmax;
     bool has_embd          = cparams.embeddings;
     bool has_embd_pre_norm = cparams.embeddings_pre_norm;
 
@@ -2198,6 +2226,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     if (has_sampling) {
         backend_float_count = 2 * n_vocab * n_outputs_max;      // logits + probs
         backend_token_count = (1 + n_vocab) * n_outputs_max;    // sampled + candidates
+    } else if (has_greedy_argmax) {
+        backend_token_count = n_outputs_max;
     }
 
     if (output_ids.empty()) {
@@ -2293,6 +2323,17 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         std::fill(sampling.candidates_count.begin(), sampling.candidates_count.end(), 0);
 
         std::fill_n(sampling.sampled.data, sampling.sampled.size, LLAMA_TOKEN_NULL);
+    } else if (has_greedy_argmax) {
+        sampling.logits     = {nullptr, 0};
+        sampling.probs      = {nullptr, 0};
+        sampling.sampled    = {(llama_token *) (base + offset), (size_t)n_outputs_max};
+        offset += sampling.sampled.size * sizeof(llama_token);
+        sampling.candidates = {nullptr, 0};
+
+        sampling.logits_count.clear();
+        sampling.probs_count.clear();
+        sampling.candidates_count.clear();
+        std::fill_n(sampling.sampled.data, sampling.sampled.size, LLAMA_TOKEN_NULL);
     } else {
         sampling.logits     = {nullptr, 0};
         sampling.probs      = {nullptr, 0};
@@ -2381,7 +2422,6 @@ void llama_context::output_reorder() {
             assert(sampling.logits.size > 0);
             assert(sampling.probs.size > 0);
             assert(sampling.candidates.size > 0);
-            assert(sampling.sampled.size > 0);
             assert(sampling.logits_count.size() > 0);
             assert(sampling.probs_count.size() > 0);
             assert(sampling.candidates_count.size() > 0);
@@ -2398,10 +2438,13 @@ void llama_context::output_reorder() {
                 std::swap(sampling.candidates.data[i0*n_vocab + k], sampling.candidates.data[i1*n_vocab + k]);
             }
 
-            std::swap(sampling.sampled.data[i0],     sampling.sampled.data[i1]);
             std::swap(sampling.logits_count[i0],     sampling.logits_count[i1]);
             std::swap(sampling.probs_count[i0],      sampling.probs_count[i1]);
             std::swap(sampling.candidates_count[i0], sampling.candidates_count[i1]);
+        }
+
+        if (sampling.sampled.has_data()) {
+            std::swap(sampling.sampled.data[i0], sampling.sampled.data[i1]);
         }
     }
 

@@ -10,6 +10,9 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <cstdlib>
+#include <cstring>
+
 using json = nlohmann::ordered_json;
 
 //
@@ -301,8 +304,17 @@ task_params server_task::params_from_json_cmpl(
     params.post_sampling_probs         = json_value(data, "post_sampling_probs", defaults.post_sampling_probs);
 
     params.speculative = defaults.speculative;
-    const int32_t draft_n_max_cap = std::max(0, defaults.speculative.draft.n_max);
-    params.speculative.draft.n_max = json_value(data, "speculative.n_max", defaults.speculative.draft.n_max);
+    int32_t draft_n_max_cap = std::max(0, defaults.speculative.draft.n_max);
+    if (defaults.speculative.kairic_edge) {
+        for (const auto type : defaults.speculative.types) {
+            if (type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD) {
+                draft_n_max_cap = std::max(draft_n_max_cap, std::max(0, defaults.speculative.ngram_mod.n_max));
+            }
+        }
+    }
+    // KAIRIC Boost allows the request-wide cap to cover the widest proposer.
+    // Each implementation retains its own limit, so MTP remains capped at four.
+    params.speculative.draft.n_max = json_value(data, "speculative.n_max", draft_n_max_cap);
     params.speculative.draft.n_max = std::max(0, std::min(params.speculative.draft.n_max, draft_n_max_cap));
     params.speculative.draft.n_min = json_value(data, "speculative.n_min", defaults.speculative.draft.n_min);
     params.speculative.draft.n_min = std::max(0, std::min(params.speculative.draft.n_min, params.speculative.draft.n_max));
@@ -405,6 +417,8 @@ task_params server_task::params_from_json_cmpl(
             std::string grammar_type = json_value(data, "grammar_type", std::string());
             if (grammar_type == "tool_calls") {
                 params.sampling.grammar = {COMMON_GRAMMAR_TYPE_TOOL_CALLS, std::move(grammar_str)};
+            } else if (grammar_type == "output_format") {
+                params.sampling.grammar = {COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, std::move(grammar_str)};
             } else {
                 // explicit grammar from the user (API field "grammar")
                 params.sampling.grammar = {COMMON_GRAMMAR_TYPE_USER, std::move(grammar_str)};
@@ -609,6 +623,71 @@ task_params server_task::params_from_json_cmpl(
             }
         } else {
             params.sampling.samplers = defaults.sampling.samplers;
+        }
+    }
+
+    // Exact-Q8 GPU argmax deliberately omits the host logits array. Fail closed
+    // when a request needs anything beyond the unmodified greedy winner.
+    const char * output_k8 = std::getenv("PROMPTFORGE_OUTPUT_K8_STRICT_GREEDY");
+    const char * q8_argmax = std::getenv("LLAMA_TARGET_GREEDY_ARGMAX_FASTPATH");
+    if ((output_k8 && std::strcmp(output_k8, "1") == 0) ||
+        (q8_argmax && std::strcmp(q8_argmax, "1") == 0)) {
+        const std::vector<enum common_sampler_type> strict_greedy_samplers = {
+            COMMON_SAMPLER_TYPE_PENALTIES,
+            COMMON_SAMPLER_TYPE_DRY,
+            COMMON_SAMPLER_TYPE_TOP_N_SIGMA,
+            COMMON_SAMPLER_TYPE_TOP_K,
+            COMMON_SAMPLER_TYPE_TYPICAL_P,
+            COMMON_SAMPLER_TYPE_TOP_P,
+            COMMON_SAMPLER_TYPE_MIN_P,
+            COMMON_SAMPLER_TYPE_XTC,
+            COMMON_SAMPLER_TYPE_TEMPERATURE,
+        };
+
+        const bool greedy_safe_speculation = std::all_of(
+            params.speculative.types.begin(), params.speculative.types.end(),
+            [](enum common_speculative_type type) {
+                return type == COMMON_SPECULATIVE_TYPE_NONE ||
+                       type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
+                       type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD;
+        });
+        const bool pure_greedy =
+            params.sampling.temp == 0.0f &&
+            (params.sampling.top_k == 0 || params.sampling.top_k == 1) &&
+            params.sampling.top_p == 1.0f &&
+            params.sampling.min_p == 0.0f &&
+            params.sampling.typ_p == 1.0f &&
+            params.sampling.min_keep == 0 &&
+            params.sampling.dynatemp_range == 0.0f &&
+            params.sampling.xtc_probability == 0.0f &&
+            params.sampling.top_n_sigma < 0.0f &&
+            params.sampling.mirostat == 0 &&
+            params.sampling.adaptive_target < 0.0f &&
+            params.sampling.penalty_repeat == 1.0f &&
+            params.sampling.penalty_freq == 0.0f &&
+            params.sampling.penalty_present == 0.0f &&
+            params.sampling.dry_multiplier == 0.0f &&
+            params.sampling.samplers == strict_greedy_samplers;
+        const bool no_logit_consumers =
+            params.sampling.n_probs == 0 &&
+            !params.post_sampling_probs &&
+            params.sampling.grammar.empty() &&
+            !params.sampling.grammar_lazy &&
+            params.sampling.grammar_triggers.empty() &&
+            !params.sampling.has_logit_bias() &&
+            !params.sampling.ignore_eos &&
+            params.sampling.reasoning_budget_tokens < 0;
+        const bool single_base_completion =
+            params.n_cmpl == 1 && params.n_indent == 0 && params.lora.empty();
+
+        if (!pure_greedy || !no_logit_consumers ||
+            !single_base_completion || !greedy_safe_speculation) {
+            throw std::runtime_error(
+                "Exact-Q8 argmax accepts only one unmodified greedy "
+                "completion (temperature=0, top_k=0/1, top_p=1, min_p=0) with "
+                "no probabilities, penalties, grammar, logit bias, LoRA, "
+                "or reasoning budget; speculation is limited to draft-MTP "
+                "and modified ngram; disable the argmax fast path otherwise");
         }
     }
 
