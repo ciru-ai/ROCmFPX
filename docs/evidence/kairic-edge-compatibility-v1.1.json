@@ -1,0 +1,48 @@
+{
+  "created_at_utc": "2026-08-22T11:41:50Z",
+  "classification": "local-custom quick release gate",
+  "hardware": "AMD Ryzen AI Max+ 395 / Radeon 8060S / gfx1151",
+  "serving": {
+    "context": 262144,
+    "batch": 2048,
+    "ubatch": 512,
+    "slots": 1,
+    "target_kv": "f16/f16",
+    "draft_kv": "f16/f16",
+    "mtp_depth": 4,
+    "prompt_cache": true,
+    "idle_slot_cache": true,
+    "context_checkpoints": 32,
+    "kairic_edge": true
+  },
+  "tasks": [
+    "HumanEval/0",
+    "HumanEval/1",
+    "HumanEval/2",
+    "HumanEval/3",
+    "HumanEval/4",
+    "HumanEval/5",
+    "HumanEval/6",
+    "HumanEval/7",
+    "HumanEval/8",
+    "HumanEval/9"
+  ],
+  "compatibility": {
+    "request_weighted_generated_tokens_per_second": 41.87086372034675,
+    "humaneval_base_passed": 10,
+    "humaneval_plus_passed": 10,
+    "sampled_chat_http": 200,
+    "forced_tool_call_http": 200
+  },
+  "fast": {
+    "request_weighted_generated_tokens_per_second": 46.36631173066556,
+    "humaneval_base_passed": 10,
+    "humaneval_plus_passed": 10,
+    "sampled_chat_http": 400,
+    "forced_tool_call_http": 400
+  },
+  "compatibility_tg_loss_percent": 9.695504866619853,
+  "raw_outputs_identical": true,
+  "dataset_hash": "fe585eb4df8c88d844eeb463ea4d0302",
+  "scope_note": "Targeted compatibility smoke test; not a leaderboard score or a universal throughput estimate."
+}

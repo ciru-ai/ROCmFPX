@@ -192,6 +192,11 @@ The runner binds `127.0.0.1:8080` by default and enables:
 - deterministic temperature 0 / top-p 1 / top-k 0 / min-p 0; and
 - reasoning disabled.
 
+Fast greedy mode is the default. It accepts exactly one unmodified greedy
+completion and intentionally rejects request features that require full target
+logits, including sampling, penalties, probabilities, grammar-constrained tool
+calls, logit bias, LoRA, and a reasoning budget.
+
 Override `HOST`, `PORT`, `CONTEXT`, or `CACHE_RAM` only if you understand the
 memory/security tradeoff. Binding beyond localhost exposes an unauthenticated
 OpenAI-compatible endpoint unless you add a trusted proxy.
@@ -231,9 +236,16 @@ recurrent state; do not remove `-ctxcp 32` while using the prompt cache.
 
 ## Request-level chat sampling
 
-The launcher defaults are the exact deterministic evaluation profile. For
-ordinary non-thinking chat, retain the runtime settings and send the upstream
-Qwen recommendation at request level:
+Sampling and tool calling require compatibility mode. Set it before starting
+the runner:
+
+```bash
+export KAIRIC_EDGE_COMPATIBILITY_MODE=1
+scripts/run-kairic-edge-gfx1151.sh
+```
+
+Then ordinary non-thinking chat can use the upstream Qwen recommendation at
+request level:
 
 ```json
 {
@@ -245,6 +257,17 @@ Qwen recommendation at request level:
   "cache_prompt": true
 }
 ```
+
+Compatibility mode disables only the target greedy argmax fast path; Kairic
+Edge, native MTP4, prompt caching, context checkpoints, and the other qualified
+launch settings remain enabled. In the release gate, sampled chat and a forced
+tool call both returned HTTP 200, and HumanEval 0–9 passed 10/10 Base and 10/10
+Plus with byte-identical output to fast mode. It measured 41.87 versus 46.37
+generated tokens/s on that short coding subset, a 9.70% reduction, so it is
+opt-in rather than the default. This subset is a compatibility smoke test, not
+a leaderboard score or a universal throughput estimate. The sanitized result
+is preserved in
+[`docs/evidence/kairic-edge-compatibility-v1.1.json`](evidence/kairic-edge-compatibility-v1.1.json).
 
 ## Evidence boundary
 

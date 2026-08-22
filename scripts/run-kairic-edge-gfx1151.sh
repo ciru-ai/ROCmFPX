@@ -13,6 +13,16 @@ readonly port="${PORT:-8080}"
 readonly context="${CONTEXT:-262144}"
 readonly cache_ram="${CACHE_RAM:-8192}"
 readonly alias_name="${MODEL_ALIAS:-main}"
+readonly compatibility_mode="${KAIRIC_EDGE_COMPATIBILITY_MODE:-0}"
+
+case "$compatibility_mode" in
+  0) readonly target_argmax_fastpath=1 ;;
+  1) readonly target_argmax_fastpath=0 ;;
+  *)
+    echo "KAIRIC_EDGE_COMPATIBILITY_MODE must be 0 or 1: $compatibility_mode" >&2
+    exit 2
+    ;;
+esac
 
 for required in "$server" "$model" "$ffn" "$gdn" "$gdn_output"; do
   [[ -r "$required" ]] || {
@@ -35,7 +45,7 @@ exec /usr/bin/env \
   HSA_OVERRIDE_GFX_VERSION=11.5.1 \
   LD_LIBRARY_PATH="$library_path" \
   GGML_CUDA_GRAPH_OPT=0 \
-  LLAMA_TARGET_GREEDY_ARGMAX_FASTPATH=1 \
+  LLAMA_TARGET_GREEDY_ARGMAX_FASTPATH="$target_argmax_fastpath" \
   LLAMA_MTP_CPU_ARGMAX_FASTPATH=1 \
   PROMPTFORGE_TARGET_ONLY=0 \
   PROMPTFORGE_MODE=iu4_ffn \
