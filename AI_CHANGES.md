@@ -257,3 +257,25 @@ byte 2: v2[5:4] | v3[5:0]<<2
 *(Repeat per file. Keep entries factual. Do not remove or rewrite earlier sessions.)*
 
 -->
+
+## Session 006 — 2026-08-23
+
+**Scope:** Make exact-M65 n-gram verification lossless by default for Kairic Edge v1.2.
+
+| File | Detail |
+|------|--------|
+| `common/arg.cpp` | Keep Kairic n-gram drafting at 24/64/64 while routing exact 65-row verification through the compact/reference path by default. The previous native IU4 M65 verifier remains available only through the explicitly unsafe `KAIRIC_UNSAFE_NATIVE_M65_VERIFY=1` diagnostic override. Startup records the selected verifier mode. |
+| `docs/kairic-edge-gfx1151.md` | Document the v1.2 correctness boundary, startup check, unsafe diagnostic override, and qualification evidence. |
+
+### Validation
+
+| Check | Result |
+|-------|--------|
+| Target equivalence | Strict compact M65 reproduced one byte-identical no-spec response hash across six repetitions. |
+| Acceptance | `9,255/9,280` drafted tokens accepted (`99.73%`), mean accepted length `64.83`. |
+| Performance | Five warm rows took `22.31–22.38 s` (`22.34 s` mean); approximately `5–8%` below the unsafe native verifier while retaining a `7.19x` speedup over no speculation. |
+| Scope | PromptForge prefill, M1 decode, M2–M5 MTP, other row routes, context, API behavior, model, and sidecars are unchanged. |
+
+Release disposition: promote strict compact M65 as the v1.2 default. Do not enable the unsafe native M65 verifier in production profiles.
+
+Qualified release-candidate build identities: `llama-server 9a307481c268b631e8bcb0a1e68aa9ae3adb77de00db87646c41827528ca6661`, `libllama-common 17776460e3a91ee2ee2e7b52cc230e93a86d97a86c11d85e9365eec8d54ec39b`, and `libggml-hip 25bd836bdbb5d0275f4ed9c61a801c15458d28cbbf72f11ca4c1f5aab1c1f9af`.

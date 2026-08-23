@@ -4,6 +4,11 @@ This guide builds and runs the immutable source release for Qwen3.8-27B IU4
 Kairic Edge. It is the known-best public Prompt Forge / Dual View runner
 corresponding to the qualified Kairic Edge release.
 
+Version 1.2 changes exact 65-row n-gram verification to the compact
+authoritative path by default. The model and PromptForge sidecars are unchanged.
+The previous native IU4 M65 verifier is retained only for controlled diagnostics
+because it changed a reproduced greedy target token.
+
 ## Scope
 
 Kairic Edge routes supported prompt and multi-token verification shapes through
@@ -63,7 +68,7 @@ ROCm tree can be used.
 ```bash
 git clone https://github.com/ciru-ai/ROCmFPX.git
 cd ROCmFPX
-git checkout kairic-edge-qwen38-27b-v1
+git checkout kairic-edge-qwen38-27b-v1.2
 git status --short
 ```
 
@@ -140,11 +145,12 @@ ldd ./build-kairic/bin/llama-server 2>&1 | tee /tmp/kairic-edge-ldd.txt
 ! grep -Eiq 'not found|version .* required by .* not found' /tmp/kairic-edge-ldd.txt
 ```
 
-The frozen release qualification used these binary identities:
+The v1.2 release-candidate qualification used these binary identities:
 
 ```text
-llama-server SHA-256  0ece51fa4489e58b7c6942ec2aa59baadca897d8cf87f8e1dc4dc0b10a6efc49
-libggml-hip SHA-256   0be22ea33b8ecb7c4fcc562a6e1671fcd5e6eb26e757cc1d0a2a27a6fc08ef43
+llama-server SHA-256    9a307481c268b631e8bcb0a1e68aa9ae3adb77de00db87646c41827528ca6661
+libllama-common SHA-256 17776460e3a91ee2ee2e7b52cc230e93a86d97a86c11d85e9365eec8d54ec39b
+libggml-hip SHA-256     25bd836bdbb5d0275f4ed9c61a801c15458d28cbbf72f11ca4c1f5aab1c1f9af
 model SHA-256         360caf7381907c3eca7ac0afd1228efc016af747f3f38637fb1c7f94daabac2a
 ```
 
@@ -187,10 +193,21 @@ The runner binds `127.0.0.1:8080` by default and enables:
 - F16 target and draft KV;
 - Kairic Edge;
 - explicit native MTP depth 4;
+- n-gram match/min/max 24/64/64 with strict compact M65 verification;
 - 8,192 MiB prompt cache, idle-slot persistence, and 32 context checkpoints;
 - metrics;
 - deterministic temperature 0 / top-p 1 / top-k 0 / min-p 0; and
 - reasoning disabled.
+
+The server log must contain:
+
+```text
+Kairic Edge: enabled (ngram=24/64/64, M65 verifier=strict-compact)
+```
+
+Do not set `KAIRIC_UNSAFE_NATIVE_M65_VERIFY=1` in a live profile. That diagnostic
+override restores the superseded native M65 verifier, which is faster but changed
+a reproduced greedy target token.
 
 Fast greedy mode is the default. It accepts exactly one unmodified greedy
 completion and intentionally rejects request features that require full target
@@ -268,6 +285,19 @@ opt-in rather than the default. This subset is a compatibility smoke test, not
 a leaderboard score or a universal throughput estimate. The sanitized result
 is preserved in
 [`docs/evidence/kairic-edge-compatibility-v1.1.json`](evidence/kairic-edge-compatibility-v1.1.json).
+
+## v1.2 M65 verification gate
+
+The frozen structured-generation repro produced the same no-spec target response
+hash in all six candidate runs. Five warm strict-M65 rows took 22.31–22.38 seconds
+(22.34 seconds mean), accepted 9,255/9,280 drafted tokens (99.73%), and retained a
+mean accepted length of 64.83 tokens. The strict route is approximately 5–8%
+slower than the unsafe native M65 verifier on this workload and approximately
+7.19x faster than speculation off.
+
+The target response itself contains two known arithmetic mistakes. The release
+gate is target equivalence: speculative verification must preserve the target
+model's tokens rather than silently changing them.
 
 ## Evidence boundary
 

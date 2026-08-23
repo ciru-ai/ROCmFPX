@@ -4176,11 +4176,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.ngram_mod.n_min = 64;
             params.speculative.ngram_mod.n_max = 64;
 
+            const char * unsafe_native_m65 = std::getenv("KAIRIC_UNSAFE_NATIVE_M65_VERIFY");
+            const bool enable_unsafe_native_m65 =
+                unsafe_native_m65 && std::strcmp(unsafe_native_m65, "1") == 0;
+
             setenv("LLAMA_SPEC_NGRAM_RS_ROLLBACK", "1", 1);
             setenv("PROMPTFORGE_ENABLE_NGRAM_MOD", "1", 1);
-            setenv("PROMPTFORGE_ENABLE_NGRAM_M65_IU4", "1", 1);
+            setenv("PROMPTFORGE_ENABLE_NGRAM_M65_IU4", enable_unsafe_native_m65 ? "1" : "0", 1);
 
-            fprintf(stderr, "Kairic Edge: enabled\n");
+            fprintf(stderr, "Kairic Edge: enabled (ngram=24/64/64, M65 verifier=%s)\n",
+                    enable_unsafe_native_m65 ? "native-unsafe" : "strict-compact");
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
