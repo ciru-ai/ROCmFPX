@@ -1,0 +1,427 @@
+{
+  "source": {
+    "base_commit": "205a3e5f40e5542e2f2eb68e3d3f81f918b1d895",
+    "diff_sha256": "2ea008f04aa365d8ab9da887ec8e273a0da3a86396dc7696cd987f2a60312d93",
+    "launcher_sha256": "35dd8b9cb067c1053d91f6be9ffb365edf2314759e1fb3cf85a6e4c6f619cd6b",
+    "final_defaults": {
+      "KAIRIC_GDN_MCOL": 8,
+      "PROMPTFORGE_SMALLM_CK_VARIANT": 1
+    }
+  },
+  "gpu": {
+    "model": "AMD Radeon 8060S Graphics",
+    "arch": "gfx1151",
+    "toolchain": "TheRock 7.15.0a20260718"
+  },
+  "build": {
+    "targets": [
+      "llama-server",
+      "llama-bench",
+      "test-backend-ops"
+    ],
+    "C": "GNU 13.4.0",
+    "HIP": "Clang 23.0.0",
+    "build_type": "Release",
+    "GGML_BUILD_TESTS": false,
+    "LLAMA_BUILD_TESTS": true,
+    "version": "0 (unknown)",
+    "ldd_missing": [],
+    "binaries": {
+      "llama-server": "07ba59c447c659b7f73b794abac077e1dec8153d812b94777221880394370ed3",
+      "llama-bench": "4ea4d1538428bb99735cd1e97570834c56996c18b117db023a32704994015982",
+      "test-backend-ops": "ff8b6a766be767ef3c21fed022a32b5197d7a2ade9c8c2266b73efb300c7763b",
+      "libggml-hip.so.0": "ca9720a89625702cef651e11f819e3ef698616cd15817be7074c6cc8e63614b5",
+      "libggml-base.so.0": "6da5f56f4abb6332e608201b447a5119903121536d77a19d1cb79a90ab51f0c4",
+      "libllama.so.0": "c70578e763cd7413b11c708c35375e70c86486dc8c89d9acf543e9d95e64c346",
+      "libllama-common.so.0": "4d0c79fd413f93c67047fff6e70ad1d998cde19602f6e9b08a1c41026c9c0a8b"
+    }
+  },
+  "baseline": {
+    "server_sha256": "9a307481c268b631e8bcb0a1e68aa9ae3adb77de00db87646c41827528ca6661",
+    "libggml_hip_sha256": "25bd836bdbb5d0275f4ed9c61a801c15458d28cbbf72f11ca4c1f5aab1c1f9af",
+    "model_sha256": "360caf7381907c3eca7ac0afd1228efc016af747f3f38637fb1c7f94daabac2a"
+  },
+  "backend_checks": {
+    "GATED_DELTA_NET_MCOL8": "52/52",
+    "GATED_DELTA_NET_invalid_MCOL3": "52/52",
+    "SOFT_MAX_GROUP_NORM": "220/220",
+    "MUL_MAT_f16_bf16_bounded": "36/36"
+  },
+  "serving_A_C_C_A": {
+    "settings": {
+      "context": 32768,
+      "KV": "f16/f16",
+      "batch": 2048,
+      "ubatch": 512,
+      "threads": 16,
+      "batch_threads": 32,
+      "slots": 1,
+      "draft": "MTP4",
+      "comparison_MCOL": 1,
+      "comparison_CK": 0
+    },
+    "prompts": {
+      "short_tokens": 498,
+      "long_tokens": 3917
+    },
+    "rows": {
+      "short": {
+        "warm": {
+          "baseline_avg_tps": 26.935884180142303,
+          "candidate_avg_tps": 26.914557181848014,
+          "avg_tps_delta_percent": -0.07917690079025652,
+          "baseline_ttfp_ms": 1102.8059720993042,
+          "candidate_ttfp_ms": 1093.981385231018,
+          "baseline_total_ms": 5855.30960559845,
+          "candidate_total_ms": 5850.2525091171265,
+          "baseline_tokens_evaluated": [
+            498
+          ],
+          "candidate_tokens_evaluated": [
+            498
+          ],
+          "baseline_predicted_tokens": [
+            128
+          ],
+          "candidate_predicted_tokens": [
+            128
+          ],
+          "baseline_timing": {
+            "cache_n": 0,
+            "draft_n": 148,
+            "draft_n_accepted": 89,
+            "predicted_ms": 4742.842,
+            "predicted_n": 128,
+            "predicted_per_second": 26.988037973856184,
+            "predicted_per_token_ms": 37.053453125,
+            "prompt_ms": 1102.713,
+            "prompt_n": 498,
+            "prompt_per_second": 451.6134297863542,
+            "prompt_per_token_ms": 2.21428313253012
+          },
+          "candidate_timing": {
+            "cache_n": 0,
+            "draft_n": 148,
+            "draft_n_accepted": 89,
+            "predicted_ms": 4757.039,
+            "predicted_n": 128,
+            "predicted_per_second": 26.907494346798504,
+            "predicted_per_token_ms": 37.1643671875,
+            "prompt_ms": 1090.242,
+            "prompt_n": 498,
+            "prompt_per_second": 456.7793205545191,
+            "prompt_per_token_ms": 2.1892409638554216
+          }
+        },
+        "measured": {
+          "baseline_avg_tps": 47.16849396870664,
+          "candidate_avg_tps": 47.105202040750186,
+          "avg_tps_delta_percent": -0.13418263470198477,
+          "baseline_ttfp_ms": 99.84803199768066,
+          "candidate_ttfp_ms": 100.29590129852295,
+          "baseline_total_ms": 2814.635753631592,
+          "candidate_total_ms": 2818.59028339386,
+          "baseline_tokens_evaluated": [
+            4
+          ],
+          "candidate_tokens_evaluated": [
+            4
+          ],
+          "baseline_predicted_tokens": [
+            128
+          ],
+          "candidate_predicted_tokens": [
+            128
+          ],
+          "baseline_timing": {
+            "cache_n": 494,
+            "draft_n": 185,
+            "draft_n_accepted": 110,
+            "predicted_ms": 2706.958,
+            "predicted_n": 128,
+            "predicted_per_second": 47.285550791700494,
+            "predicted_per_token_ms": 21.148109375,
+            "prompt_ms": 96.657,
+            "prompt_n": 4,
+            "prompt_per_second": 41.38344868969656,
+            "prompt_per_token_ms": 24.16425
+          },
+          "candidate_timing": {
+            "cache_n": 494,
+            "draft_n": 185,
+            "draft_n_accepted": 110,
+            "predicted_ms": 2716.998,
+            "predicted_n": 128,
+            "predicted_per_second": 47.11081863144544,
+            "predicted_per_token_ms": 21.226546875,
+            "prompt_ms": 96.406,
+            "prompt_n": 4,
+            "prompt_per_second": 41.491193494180855,
+            "prompt_per_token_ms": 24.1015
+          }
+        }
+      },
+      "long": {
+        "warm": {
+          "baseline_avg_tps": 25.907014871552338,
+          "candidate_avg_tps": 25.900378891283324,
+          "avg_tps_delta_percent": -0.025614607865531713,
+          "baseline_ttfp_ms": 8509.991765022278,
+          "candidate_ttfp_ms": 8384.48452949524,
+          "baseline_total_ms": 13451.929688453674,
+          "candidate_total_ms": 13327.773213386536,
+          "baseline_tokens_evaluated": [
+            3917
+          ],
+          "candidate_tokens_evaluated": [
+            3917
+          ],
+          "baseline_predicted_tokens": [
+            128
+          ],
+          "candidate_predicted_tokens": [
+            128
+          ],
+          "baseline_timing": {
+            "cache_n": 0,
+            "draft_n": 152,
+            "draft_n_accepted": 89,
+            "predicted_ms": 4938.846,
+            "predicted_n": 128,
+            "predicted_per_second": 25.916985465835545,
+            "predicted_per_token_ms": 38.584734375,
+            "prompt_ms": 8516.691,
+            "prompt_n": 3917,
+            "prompt_per_second": 459.9204080551942,
+            "prompt_per_token_ms": 2.1742892519785553
+          },
+          "candidate_timing": {
+            "cache_n": 0,
+            "draft_n": 152,
+            "draft_n_accepted": 89,
+            "predicted_ms": 4947.623,
+            "predicted_n": 128,
+            "predicted_per_second": 25.871009169453696,
+            "predicted_per_token_ms": 38.6533046875,
+            "prompt_ms": 8393.092,
+            "prompt_n": 3917,
+            "prompt_per_second": 466.69332350938123,
+            "prompt_per_token_ms": 2.1427347459790655
+          }
+        },
+        "measured": {
+          "baseline_avg_tps": 56.455808365091734,
+          "candidate_avg_tps": 56.296105938998124,
+          "avg_tps_delta_percent": -0.2828804169463628,
+          "baseline_ttfp_ms": 109.60328578948975,
+          "candidate_ttfp_ms": 108.89983177185059,
+          "baseline_total_ms": 2377.305746078491,
+          "candidate_total_ms": 2383.9927911758423,
+          "baseline_tokens_evaluated": [
+            4
+          ],
+          "candidate_tokens_evaluated": [
+            4
+          ],
+          "baseline_predicted_tokens": [
+            128
+          ],
+          "candidate_predicted_tokens": [
+            128
+          ],
+          "baseline_timing": {
+            "cache_n": 3913,
+            "draft_n": 164,
+            "draft_n_accepted": 115,
+            "predicted_ms": 2262.525,
+            "predicted_n": 128,
+            "predicted_per_second": 56.57396050872366,
+            "predicted_per_token_ms": 17.6759765625,
+            "prompt_ms": 100.205,
+            "prompt_n": 4,
+            "prompt_per_second": 39.9181677561,
+            "prompt_per_token_ms": 25.05125
+          },
+          "candidate_timing": {
+            "cache_n": 3913,
+            "draft_n": 164,
+            "draft_n_accepted": 115,
+            "predicted_ms": 2274.172,
+            "predicted_n": 128,
+            "predicted_per_second": 56.28422124623819,
+            "predicted_per_token_ms": 17.76696875,
+            "prompt_ms": 100.53,
+            "prompt_n": 4,
+            "prompt_per_second": 39.78911767631553,
+            "prompt_per_token_ms": 25.1325
+          }
+        }
+      }
+    },
+    "output_identity": {
+      "short": {
+        "chars": {
+          "A1": 554,
+          "A2": 554,
+          "C1": 554,
+          "C2": 554
+        },
+        "tokens": {
+          "A1": 128,
+          "A2": 128,
+          "C1": 128,
+          "C2": 128
+        },
+        "A1_eq_A2_text": true,
+        "C1_eq_C2_text": true,
+        "A1_eq_C1_text": true,
+        "A1_eq_C1_tokens": true,
+        "answers": {
+          "A1": "{\n  \"diagnosis\": \"The code unconditionally updates the account total even when the event insert is skipped due to the unique constraint. On retry, the insert is ignored, but the total is incremented again, causing double-billing.\",\n  \"smallest_fix\": \"Check if the insert actually occurred (e.g., using `INSERT ... RETURNING` or checking row count). Only execute the `UPDATE accounts` statement if a new row was successfully inserted into `usage_events`.\",\n  \"tests\": \"Test `test_retry_idempotency`: Call `record_usage` twice with the same key. Assert the",
+          "C1": "{\n  \"diagnosis\": \"The code unconditionally updates the account total even when the event insert is skipped due to the unique constraint. On retry, the insert is ignored, but the total is incremented again, causing double-billing.\",\n  \"smallest_fix\": \"Check if the insert actually occurred (e.g., using `INSERT ... RETURNING` or checking row count). Only execute the `UPDATE accounts` statement if a new row was successfully inserted into `usage_events`.\",\n  \"tests\": \"Test `test_retry_idempotency`: Call `record_usage` twice with the same key. Assert the"
+        }
+      },
+      "long": {
+        "chars": {
+          "A1": 542,
+          "A2": 542,
+          "C1": 542,
+          "C2": 542
+        },
+        "tokens": {
+          "A1": 128,
+          "A2": 128,
+          "C1": 128,
+          "C2": 128
+        },
+        "A1_eq_A2_text": true,
+        "C1_eq_C2_text": true,
+        "A1_eq_C1_text": true,
+        "A1_eq_C1_tokens": true,
+        "answers": {
+          "A1": "{\n  \"root_cause\": \"The handler unconditionally updates `accounts.billable_total` after `INSERT ... ON CONFLICT DO NOTHING`. On a retry, the INSERT is ignored (row count 0), but the UPDATE executes again, double-counting the amount. The code ignores the INSERT result and relies on unreliable `last_insert_id()`.\",\n  \"safe_change\": \"Modify `post_usage` to use `INSERT ... ON CONFLICT (account_id, event_key) DO UPDATE SET id = usage_events.id RETURNING id, payload_hash`. If the returned `payload_hash` matches the request, return the existing",
+          "C1": "{\n  \"root_cause\": \"The handler unconditionally updates `accounts.billable_total` after `INSERT ... ON CONFLICT DO NOTHING`. On a retry, the INSERT is ignored (row count 0), but the UPDATE executes again, double-counting the amount. The code ignores the INSERT result and relies on unreliable `last_insert_id()`.\",\n  \"safe_change\": \"Modify `post_usage` to use `INSERT ... ON CONFLICT (account_id, event_key) DO UPDATE SET id = usage_events.id RETURNING id, payload_hash`. If the returned `payload_hash` matches the request, return the existing"
+        }
+      }
+    }
+  },
+  "mcol_cold_prefill_A_B_B_A": {
+    "rows": [
+      {
+        "label": "M1a-long-measured-uncached",
+        "pp_tps": 471.1291752725621,
+        "prompt_tokens": 3917,
+        "cache_tokens": 0,
+        "ttfp_ms": 8323.336362838745,
+        "tg_tps": 55.38981883201913,
+        "tokens_predicted": 128
+      },
+      {
+        "label": "M8a-long-measured-uncached",
+        "pp_tps": 510.6774213567201,
+        "prompt_tokens": 3917,
+        "cache_tokens": 0,
+        "ttfp_ms": 7678.288221359253,
+        "tg_tps": 55.42581968508608,
+        "tokens_predicted": 128
+      },
+      {
+        "label": "M8b-long-measured-uncached",
+        "pp_tps": 508.2109741134171,
+        "prompt_tokens": 3917,
+        "cache_tokens": 0,
+        "ttfp_ms": 7715.94500541687,
+        "tg_tps": 55.40921654397998,
+        "tokens_predicted": 128
+      },
+      {
+        "label": "M1b-long-measured-uncached",
+        "pp_tps": 485.8798382070997,
+        "prompt_tokens": 3917,
+        "cache_tokens": 0,
+        "ttfp_ms": 8070.074558258057,
+        "tg_tps": 55.42245986526281,
+        "tokens_predicted": 128
+      }
+    ],
+    "mean_mcol1_pp_tps": 478.5045067398309,
+    "mean_mcol8_pp_tps": 509.4441977350686,
+    "mcol8_delta_percent": 6.465914230575898,
+    "text_and_token_ids_identical": true
+  },
+  "ck_cold_prefill_A_B_B_A": {
+    "rows": [
+      {
+        "label": "K0a-long-measured-uncached",
+        "pp_tps": 509.534553128961,
+        "prompt_tokens": 3917,
+        "cache_tokens": 0,
+        "ttfp_ms": 7695.768594741821,
+        "tg_tps": 55.484682543088404,
+        "tokens_predicted": 128
+      },
+      {
+        "label": "K1a-long-measured-uncached",
+        "pp_tps": 523.3752452194075,
+        "prompt_tokens": 3917,
+        "cache_tokens": 0,
+        "ttfp_ms": 7493.3531284332275,
+        "tg_tps": 55.63243649209672,
+        "tokens_predicted": 128
+      },
+      {
+        "label": "K1b-long-measured-uncached",
+        "pp_tps": 522.3726734945411,
+        "prompt_tokens": 3917,
+        "cache_tokens": 0,
+        "ttfp_ms": 7508.106470108032,
+        "tg_tps": 55.58392651804914,
+        "tokens_predicted": 128
+      },
+      {
+        "label": "K0b-long-measured-uncached",
+        "pp_tps": 507.2736856146403,
+        "prompt_tokens": 3917,
+        "cache_tokens": 0,
+        "ttfp_ms": 7729.936599731445,
+        "tg_tps": 55.51731511324448,
+        "tokens_predicted": 128
+      }
+    ],
+    "mean_ck0_pp_tps": 508.4041193718007,
+    "mean_ck1_pp_tps": 522.8739593569743,
+    "ck1_delta_percent": 2.846129571698386,
+    "mirror_1_delta_percent": 2.71634023746834,
+    "mirror_2_delta_percent": 2.976497363865027,
+    "text_and_token_ids_identical": true
+  },
+  "compatibility_final": {
+    "forced_tool_arguments": {
+      "location": "Boston"
+    },
+    "direct_completion_json_schema": {
+      "ok": true,
+      "count": 1000000000000000
+    },
+    "sampled_chars": 319,
+    "cached_continuations": [
+      {
+        "tokens_predicted": 32,
+        "response_chars": 119
+      },
+      {
+        "tokens_predicted": 32,
+        "response_chars": 179
+      }
+    ],
+    "nested_chat_schema_http400_baseline_and_candidate_same": true
+  },
+  "qualification_scope": {
+    "os": "NixOS",
+    "new_context_qualification": 32768,
+    "full_quality_suite_rerun": false,
+    "context_ladder_rerun": false,
+    "nested_chat_schema_note": "HTTP400 reproduced on v1.2 and discarded strict-math candidate; not claimed fixed by final build",
+    "schema_smoke_is_structural_only": true
+  }
+}

@@ -4,7 +4,12 @@ This guide builds and runs the immutable source release for Qwen3.8-27B IU4
 Kairic Edge. It is the known-best public Prompt Forge / Dual View runner
 corresponding to the qualified Kairic Edge release.
 
-Version 1.2 changes exact 65-row n-gram verification to the compact
+Version 1.3 adds selected correctness fixes and measured MCOL8/CK1 prefill
+improvements. See [v1.3 validation and patch notes](kairic-edge-v1.3.md).
+The new qualification uses 32K context; earlier 256K and quality-suite
+results were not rerun.
+
+Version 1.2 changed exact 65-row n-gram verification to the compact
 authoritative path by default. The model and PromptForge sidecars are unchanged.
 The previous native IU4 M65 verifier is retained only for controlled diagnostics
 because it changed a reproduced greedy target token.
@@ -32,9 +37,9 @@ The release was certified with:
 TheRock             7.15.0a20260718
 AMD clang           23.0.0
 HIP                 7.15.0
-GCC / G++           13.3.0
-CMake               4.4.2
-Ninja               1.13.0
+GCC / G++           13.4.0
+CMake               4.1.2
+Ninja               1.13.2
 Composable Kernel   fdf4bb7fcc984811cef48ce817d89aac064b984a + release patch
 GPU target          gfx1151
 ```
@@ -68,7 +73,7 @@ ROCm tree can be used.
 ```bash
 git clone https://github.com/ciru-ai/ROCmFPX.git
 cd ROCmFPX
-git checkout kairic-edge-qwen38-27b-v1.2
+git checkout kairic-edge-qwen38-27b-v1.3
 git status --short
 ```
 
@@ -145,12 +150,12 @@ ldd ./build-kairic/bin/llama-server 2>&1 | tee /tmp/kairic-edge-ldd.txt
 ! grep -Eiq 'not found|version .* required by .* not found' /tmp/kairic-edge-ldd.txt
 ```
 
-The v1.2 release-candidate qualification used these binary identities:
+The v1.3 release-candidate qualification used these binary identities:
 
 ```text
-llama-server SHA-256    9a307481c268b631e8bcb0a1e68aa9ae3adb77de00db87646c41827528ca6661
-libllama-common SHA-256 17776460e3a91ee2ee2e7b52cc230e93a86d97a86c11d85e9365eec8d54ec39b
-libggml-hip SHA-256     25bd836bdbb5d0275f4ed9c61a801c15458d28cbbf72f11ca4c1f5aab1c1f9af
+llama-server SHA-256    07ba59c447c659b7f73b794abac077e1dec8153d812b94777221880394370ed3
+libllama-common SHA-256 4d0c79fd413f93c67047fff6e70ad1d998cde19602f6e9b08a1c41026c9c0a8b
+libggml-hip SHA-256     ca9720a89625702cef651e11f819e3ef698616cd15817be7074c6cc8e63614b5
 model SHA-256         360caf7381907c3eca7ac0afd1228efc016af747f3f38637fb1c7f94daabac2a
 ```
 
@@ -181,13 +186,13 @@ export KAIRIC_GDN_SIDECAR=/path/to/Qwen3.8-27B-Kairic-IU4-GDN.pfs
 export KAIRIC_GDN_OUTPUT_SIDECAR=/path/to/Qwen3.8-27B-Kairic-IU4-GDN-Output.pfs
 export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
 
-scripts/run-kairic-edge-gfx1151.sh
+CONTEXT=32768 scripts/run-kairic-edge-gfx1151.sh
 ```
 
 The runner binds `127.0.0.1:8080` by default and enables:
 
 - full `ROCm0` offload and flash attention;
-- 262,144 context with one slot;
+- 32,768 context in the command above, with one slot (the retained default is 262,144);
 - batch 2,048 and ubatch 512;
 - 16 target threads and 32 batch threads;
 - F16 target and draft KV;

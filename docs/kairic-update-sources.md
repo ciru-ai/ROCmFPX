@@ -5,8 +5,7 @@ All changes are in a separate checkout and build. Existing release artifacts,
 model weights, sidecars, and installed libraries are preserved.
 
 Inspected public tips: Ciru `112629f1ed1a`, Charlie `fb08d7cdb670`,
-llama.cpp `70596c4dcb`. The requested Carlos fork resolves to the actual
-parent repository, `charlie12345/ROCmFPX`.
+llama.cpp `70596c4dcb`. The parent fork is `charlie12345/ROCmFPX`.
 
 | Source | Decision and evidence |
 | --- | --- |
@@ -38,7 +37,8 @@ parent repository, `charlie12345/ROCmFPX`.
   model converters, and web UI changes: outside this gfx1151 Kairic runner.
 
 The source audit alone establishes concrete bug mechanisms, not a measured
-speed gain. Final build and serving evidence live alongside the update package.
+speed gain. Final build and serving evidence are in [the v1.3 release notes](kairic-edge-v1.3.md)
+and [validation JSON](kairic-edge-v1.3-validation.json).
 
 The final candidate excludes the strict-math compiler-policy change after the
 first final gate. This narrowing preserves all targeted source fixes and leaves
