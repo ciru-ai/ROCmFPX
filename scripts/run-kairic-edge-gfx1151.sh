@@ -14,14 +14,25 @@ readonly context="${CONTEXT:-262144}"
 readonly cache_ram="${CACHE_RAM:-8192}"
 readonly alias_name="${MODEL_ALIAS:-main}"
 readonly compatibility_mode="${KAIRIC_EDGE_COMPATIBILITY_MODE:-0}"
+readonly gdn_mcol="${KAIRIC_GDN_MCOL:-8}"
+readonly ck_variant="${PROMPTFORGE_SMALLM_CK_VARIANT:-1}"
 
 case "$compatibility_mode" in
-  0) readonly target_argmax_fastpath=1 ;;
-  1) readonly target_argmax_fastpath=0 ;;
+  0) readonly target_argmax_fastpath=1; readonly draft_sampling=--spec-draft-backend-sampling ;;
+  1) readonly target_argmax_fastpath=0; readonly draft_sampling=--no-spec-draft-backend-sampling ;;
   *)
     echo "KAIRIC_EDGE_COMPATIBILITY_MODE must be 0 or 1: $compatibility_mode" >&2
     exit 2
     ;;
+esac
+
+case "$gdn_mcol" in
+  1|4|8|16) ;;
+  *) echo "KAIRIC_GDN_MCOL must be 1, 4, 8, or 16: $gdn_mcol" >&2; exit 2 ;;
+esac
+case "$ck_variant" in
+  0|1) ;;
+  *) echo "PROMPTFORGE_SMALLM_CK_VARIANT must be 0 or 1: $ck_variant" >&2; exit 2 ;;
 esac
 
 for required in "$server" "$model" "$ffn" "$gdn" "$gdn_output"; do
@@ -39,14 +50,18 @@ done
 readonly server_dir="$(cd -- "$(dirname -- "$server")" && pwd)"
 readonly library_path="$server_dir:$rocm/lib:$rocm/lib/rocm_sysdeps/lib:$rocm/lib/llvm/lib:$rocm/llvm/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-exec /usr/bin/env \
+exec /usr/bin/env -i \
+  HOME="${HOME}" PATH="${PATH}" LANG="${LANG:-C.UTF-8}" TMPDIR="${TMPDIR:-/tmp}" \
   ROCM_PATH="$rocm" \
   HIP_VISIBLE_DEVICES=0 \
   HSA_OVERRIDE_GFX_VERSION=11.5.1 \
   LD_LIBRARY_PATH="$library_path" \
   GGML_CUDA_GRAPH_OPT=0 \
+  KAIRIC_UNSAFE_NATIVE_M65_VERIFY=0 \
+  KAIRIC_GDN_MCOL="$gdn_mcol" \
+  PROMPTFORGE_SMALLM_CK_VARIANT="$ck_variant" \
   LLAMA_TARGET_GREEDY_ARGMAX_FASTPATH="$target_argmax_fastpath" \
-  LLAMA_MTP_CPU_ARGMAX_FASTPATH=1 \
+  LLAMA_MTP_CPU_ARGMAX_FASTPATH="$target_argmax_fastpath" \
   PROMPTFORGE_TARGET_ONLY=0 \
   PROMPTFORGE_MODE=iu4_ffn \
   PROMPTFORGE_IU4_SIDECAR="$ffn" \
@@ -80,6 +95,6 @@ exec /usr/bin/env \
     --spec-draft-type-k f16 --spec-draft-type-v f16 \
     --spec-draft-n-max 4 --spec-draft-n-min 0 \
     --spec-draft-p-min 0.0 --spec-draft-p-split 0.10 \
-    --spec-draft-backend-sampling \
+    "$draft_sampling" \
     --temp 0 --top-p 1.0 --top-k 0 --min-p 0.0 \
     --reasoning off --reasoning-format none --reasoning-budget -1

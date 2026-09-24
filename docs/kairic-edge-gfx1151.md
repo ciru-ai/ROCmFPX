@@ -275,9 +275,10 @@ request level:
 }
 ```
 
-Compatibility mode disables only the target greedy argmax fast path; Kairic
-Edge, native MTP4, prompt caching, context checkpoints, and the other qualified
-launch settings remain enabled. In the release gate, sampled chat and a forced
+Compatibility mode disables both target and MTP greedy argmax shortcuts and
+draft backend sampling. Kairic Edge, native MTP4, prompt caching, and context
+checkpoints remain enabled. The historical v1.1 release gate disabled only the
+target shortcut: sampled chat and a forced
 tool call both returned HTTP 200, and HumanEval 0–9 passed 10/10 Base and 10/10
 Plus with byte-identical output to fast mode. It measured 41.87 versus 46.37
 generated tokens/s on that short coding subset, a 9.70% reduction, so it is
@@ -285,6 +286,36 @@ opt-in rather than the default. This subset is a compatibility smoke test, not
 a leaderboard score or a universal throughput estimate. The sanitized result
 is preserved in
 [`docs/evidence/kairic-edge-compatibility-v1.1.json`](evidence/kairic-edge-compatibility-v1.1.json).
+
+## September 2026 runner update
+
+This source retains the v1.2 model, sidecar layout, strict compact M65 verifier,
+and recurrent checkpoint contract. It selectively backports correctness fixes
+instead of replacing the Kairic runtime with either fork's main branch.
+
+The launcher now isolates inherited optimization variables and explicitly pins
+`KAIRIC_UNSAFE_NATIVE_M65_VERIFY=0`. Compatibility mode disables both argmax
+shortcuts, including the MTP shortcut, and backend draft sampling. Inference
+libraries must all come from the same build; never copy one shared library
+into an older installed engine.
+
+The final prefill settings are:
+
+- `KAIRIC_GDN_MCOL=4|8|16` reuses Q/K loads across state columns on RDNA3.5,
+  for non-KDA state width 128 and batches of at least 96 tokens. The runner
+  defaults to `8` after the matched final cold-prefill check: 3,917 prompt tokens,
+  cache disabled, +6.47% PP, identical 128 output token IDs, unchanged TG on Sozo
+  gfx1151. Set `1` to recover the original route. Direct library use still defaults
+  to `1`; other shapes always retain the original grid.
+- `PROMPTFORGE_SMALLM_CK_VARIANT=1` selects the prior campaign's alternate CK
+  tile for eligible FFN/GDN projection rows. The runner defaults to `1` after
+  a separate cold-prefill comparison at MCOL8 measured a further +2.85% PP,
+  with identical output tokens and unchanged TG. Set `0` to recover v1.2's
+  tile. Direct library use still defaults to `0`.
+
+No E5 attention sidecar or late-Q6 keeper bypass is enabled. The model graph
+and normalization formula are unchanged. See `docs/kairic-update-sources.md`
+for provenance and the distinction between source fixes and measured gains.
 
 ## v1.2 M65 verification gate
 

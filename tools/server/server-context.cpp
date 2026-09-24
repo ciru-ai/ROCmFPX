@@ -787,6 +787,10 @@ private:
 
             auto params_dft = params_base;
 
+            // Drafting needs token logits even if the target serves embeddings.
+            params_dft.embedding    = false;
+            params_dft.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
+
             params_dft.devices      = params_spec.devices;
             params_dft.model        = params_spec.mparams;
             params_dft.n_gpu_layers = params_spec.n_gpu_layers;
@@ -832,6 +836,8 @@ private:
                     params_base.model.path.c_str());
 
             auto cparams_mtp = common_context_params_to_llama(params_base);
+            cparams_mtp.embeddings   = false;
+            cparams_mtp.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
             cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
             cparams_mtp.type_k   = params_base.speculative.draft.cache_type_k;
             cparams_mtp.type_v   = params_base.speculative.draft.cache_type_v;

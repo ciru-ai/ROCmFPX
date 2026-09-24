@@ -371,6 +371,11 @@ struct PFState {
     std::unique_ptr<ck::tensor_operation::device::BaseInvoker> iu4_smallm_gate_invoker;
     std::unique_ptr<ck::tensor_operation::device::BaseInvoker> iu4_smallm_down_invoker;
     std::array<PFIU4RowRouteCache, PF_SMALLM_BUCKETS> iu4_smallm_routes;
+    std::unique_ptr<IU4PaddedDeviceOp> iu4_smallm_gate_v3_op;
+    std::unique_ptr<IU4PaddedDeviceOp> iu4_smallm_down_v3_op;
+    std::unique_ptr<ck::tensor_operation::device::BaseInvoker> iu4_smallm_gate_v3_invoker;
+    std::unique_ptr<ck::tensor_operation::device::BaseInvoker> iu4_smallm_down_v3_invoker;
+    int smallm_ck_variant = 0;
     std::unique_ptr<CKDeviceOp> gate_tail1476_op;
     std::unique_ptr<CKDeviceOp> down_tail1476_op;
     std::unique_ptr<ck::tensor_operation::device::BaseInvoker> gate_tail1476_invoker;
@@ -1607,18 +1612,34 @@ bool ensure_smallm_iu4_cache(PFState & s, int rows) {
         const std::array<const void *, 4> down_d{
             s.device_file + s.down_scale[layer], s.down_a_scale,
             s.device_file + s.down_sum[layer], s.down_a_zero};
-        auto gate_arg = s.iu4_smallm_gate_op->MakeArgumentPointer(
-            s.gate_a4, s.device_file + s.gate_weight[layer], gate_d, s.gate_out,
-            plan.execution_rows, 2 * PF_I, PF_H / 2, PF_H / 2, PF_H / 2,
-            std::array<ck::index_t, 4>{0, 0, 0, 0}, 2 * PF_I, 1,
-            PassThrough{}, PassThrough{}, IU4ScaleCorrect{});
-        auto down_arg = s.iu4_smallm_down_op->MakeArgumentPointer(
-            s.down_a4, s.device_file + s.down_weight[layer], down_d, s.down_out,
-            plan.execution_rows, PF_H, PF_I / 2, PF_I / 2, PF_I / 2,
-            std::array<ck::index_t, 4>{0, 0, 0, 0}, PF_H, 1,
-            PassThrough{}, PassThrough{}, IU4ScaleCorrect{});
-        if (!s.iu4_smallm_gate_op->IsSupportedArgument(gate_arg.get()) ||
-            !s.iu4_smallm_down_op->IsSupportedArgument(down_arg.get())) {
+        auto gate_arg = s.smallm_ck_variant == 1
+            ? s.iu4_smallm_gate_v3_op->MakeArgumentPointer(
+                s.gate_a4, s.device_file + s.gate_weight[layer], gate_d, s.gate_out,
+                plan.execution_rows, 2 * PF_I, PF_H / 2, PF_H / 2, PF_H / 2,
+                std::array<ck::index_t, 4>{0, 0, 0, 0}, 2 * PF_I, 1,
+                PassThrough{}, PassThrough{}, IU4ScaleCorrect{})
+            : s.iu4_smallm_gate_op->MakeArgumentPointer(
+                s.gate_a4, s.device_file + s.gate_weight[layer], gate_d, s.gate_out,
+                plan.execution_rows, 2 * PF_I, PF_H / 2, PF_H / 2, PF_H / 2,
+                std::array<ck::index_t, 4>{0, 0, 0, 0}, 2 * PF_I, 1,
+                PassThrough{}, PassThrough{}, IU4ScaleCorrect{});
+        auto down_arg = s.smallm_ck_variant == 1
+            ? s.iu4_smallm_down_v3_op->MakeArgumentPointer(
+                s.down_a4, s.device_file + s.down_weight[layer], down_d, s.down_out,
+                plan.execution_rows, PF_H, PF_I / 2, PF_I / 2, PF_I / 2,
+                std::array<ck::index_t, 4>{0, 0, 0, 0}, PF_H, 1,
+                PassThrough{}, PassThrough{}, IU4ScaleCorrect{})
+            : s.iu4_smallm_down_op->MakeArgumentPointer(
+                s.down_a4, s.device_file + s.down_weight[layer], down_d, s.down_out,
+                plan.execution_rows, PF_H, PF_I / 2, PF_I / 2, PF_I / 2,
+                std::array<ck::index_t, 4>{0, 0, 0, 0}, PF_H, 1,
+                PassThrough{}, PassThrough{}, IU4ScaleCorrect{});
+        if (!(s.smallm_ck_variant == 1
+                ? s.iu4_smallm_gate_v3_op->IsSupportedArgument(gate_arg.get())
+                : s.iu4_smallm_gate_op->IsSupportedArgument(gate_arg.get())) ||
+            !(s.smallm_ck_variant == 1
+                ? s.iu4_smallm_down_v3_op->IsSupportedArgument(down_arg.get())
+                : s.iu4_smallm_down_op->IsSupportedArgument(down_arg.get()))) {
             std::fprintf(stderr,
                 "{\"record\":\"promptforge_smallm_iu4_cache\",\"ready\":false,"
                 "\"rows\":%d,\"execution_rows\":%d,\"bucket\":%d,\"layer\":%d}\n",
@@ -1677,19 +1698,36 @@ bool ensure_smallm_gdn_iu4_cache(PFState & s, int rows) {
         const std::array<const void *, 4> output_d{
             s.gdn_output_device_file + s.gdn_output_scale[layer], s.gate_a_scale,
             s.gdn_output_device_file + s.gdn_output_sum[layer], s.gate_a_zero};
-        auto gdn_arg = s.iu4_smallm_gate_op->MakeArgumentPointer(
-            s.gate_a4, s.gdn_device_file + s.gdn_weight[layer], gdn_d, s.gate_out,
-            plan.execution_rows, PF_GDN_N, PF_H / 2, PF_H / 2, PF_H / 2,
-            std::array<ck::index_t, 4>{0, 0, 0, 0}, PF_GDN_N, 1,
-            PassThrough{}, PassThrough{}, IU4ScaleCorrect{});
-        auto output_arg = s.iu4_smallm_down_op->MakeArgumentPointer(
-            s.gate_a4, s.gdn_output_device_file + s.gdn_output_weight[layer], output_d, s.down_out,
-            plan.execution_rows, PF_H, PF_ATTENTION_VALUE_N / 2,
-            PF_ATTENTION_VALUE_N / 2, PF_ATTENTION_VALUE_N / 2,
-            std::array<ck::index_t, 4>{0, 0, 0, 0}, PF_H, 1,
-            PassThrough{}, PassThrough{}, IU4ScaleCorrect{});
-        if (!s.iu4_smallm_gate_op->IsSupportedArgument(gdn_arg.get()) ||
-            !s.iu4_smallm_down_op->IsSupportedArgument(output_arg.get())) {
+        auto gdn_arg = s.smallm_ck_variant == 1
+            ? s.iu4_smallm_gate_v3_op->MakeArgumentPointer(
+                s.gate_a4, s.gdn_device_file + s.gdn_weight[layer], gdn_d, s.gate_out,
+                plan.execution_rows, PF_GDN_N, PF_H / 2, PF_H / 2, PF_H / 2,
+                std::array<ck::index_t, 4>{0, 0, 0, 0}, PF_GDN_N, 1,
+                PassThrough{}, PassThrough{}, IU4ScaleCorrect{})
+            : s.iu4_smallm_gate_op->MakeArgumentPointer(
+                s.gate_a4, s.gdn_device_file + s.gdn_weight[layer], gdn_d, s.gate_out,
+                plan.execution_rows, PF_GDN_N, PF_H / 2, PF_H / 2, PF_H / 2,
+                std::array<ck::index_t, 4>{0, 0, 0, 0}, PF_GDN_N, 1,
+                PassThrough{}, PassThrough{}, IU4ScaleCorrect{});
+        auto output_arg = s.smallm_ck_variant == 1
+            ? s.iu4_smallm_down_v3_op->MakeArgumentPointer(
+                s.gate_a4, s.gdn_output_device_file + s.gdn_output_weight[layer], output_d, s.down_out,
+                plan.execution_rows, PF_H, PF_ATTENTION_VALUE_N / 2,
+                PF_ATTENTION_VALUE_N / 2, PF_ATTENTION_VALUE_N / 2,
+                std::array<ck::index_t, 4>{0, 0, 0, 0}, PF_H, 1,
+                PassThrough{}, PassThrough{}, IU4ScaleCorrect{})
+            : s.iu4_smallm_down_op->MakeArgumentPointer(
+                s.gate_a4, s.gdn_output_device_file + s.gdn_output_weight[layer], output_d, s.down_out,
+                plan.execution_rows, PF_H, PF_ATTENTION_VALUE_N / 2,
+                PF_ATTENTION_VALUE_N / 2, PF_ATTENTION_VALUE_N / 2,
+                std::array<ck::index_t, 4>{0, 0, 0, 0}, PF_H, 1,
+                PassThrough{}, PassThrough{}, IU4ScaleCorrect{});
+        if (!(s.smallm_ck_variant == 1
+                ? s.iu4_smallm_gate_v3_op->IsSupportedArgument(gdn_arg.get())
+                : s.iu4_smallm_gate_op->IsSupportedArgument(gdn_arg.get())) ||
+            !(s.smallm_ck_variant == 1
+                ? s.iu4_smallm_down_v3_op->IsSupportedArgument(output_arg.get())
+                : s.iu4_smallm_down_op->IsSupportedArgument(output_arg.get()))) {
             std::fprintf(stderr,
                 "{\"record\":\"promptforge_smallm_gdn_iu4_cache\",\"ready\":false,"
                 "\"rows\":%d,\"execution_rows\":%d,\"bucket\":%d,\"layer\":%d}\n",
@@ -1724,6 +1762,8 @@ bool build_iu4_routes(PFState & s) {
     if (s.smallm_iu4_enabled) {
         s.iu4_smallm_gate_op = std::make_unique<IU4SmallGateDeviceOp>();
         s.iu4_smallm_down_op = std::make_unique<IU4SmallDownDeviceOp>();
+        s.iu4_smallm_gate_v3_op = std::make_unique<IU4PaddedDeviceOp>();
+        s.iu4_smallm_down_v3_op = std::make_unique<IU4PaddedDeviceOp>();
     }
     for (int layer = 0; layer < PF_LAYERS; ++layer) {
         const std::array<const void *, 4> gate_d{
@@ -1807,6 +1847,8 @@ bool build_iu4_routes(PFState & s) {
     if (s.smallm_iu4_enabled) {
         s.iu4_smallm_gate_invoker = s.iu4_smallm_gate_op->MakeInvokerPointer();
         s.iu4_smallm_down_invoker = s.iu4_smallm_down_op->MakeInvokerPointer();
+        s.iu4_smallm_gate_v3_invoker = s.iu4_smallm_gate_v3_op->MakeInvokerPointer();
+        s.iu4_smallm_down_v3_invoker = s.iu4_smallm_down_v3_op->MakeInvokerPointer();
     }
     std::fprintf(stderr,
         "{\"record\":\"promptforge_init\",\"mode\":\"iu4_ffn\","
@@ -1821,6 +1863,12 @@ bool build_iu4_routes(PFState & s) {
         "\"min_rows\":%d,\"max_rows\":%d,\"buckets\":[128,256,512],"
         "\"scope\":\"ffn_gate_up_down\",\"cache\":\"lazy_bucket\"}\n",
         s.smallm_iu4_enabled ? "true" : "false", PF_SMALLM_MIN, PF_SMALLM_MAX);
+    std::fprintf(stderr,
+        "{\"record\":\"promptforge_smallm_ck_variant\",\"variant\":%d,"
+        "\"gate\":\"%s\",\"down\":\"%s\"}\n",
+        s.smallm_ck_variant,
+        s.smallm_ck_variant == 1 ? "256x128x128_v3" : "128x128x64_v1",
+        s.smallm_ck_variant == 1 ? "256x128x128_v3" : "256x128x256_v1");
     std::fflush(stderr);
     return true;
 }
@@ -2203,9 +2251,15 @@ void run_gate_fused(PFState & s, int layer, int rows, const float * input, hipSt
                 activations, matrix, s.gate_out, rows, 2 * PF_I, stream);
         } else if (smallm_iu4_route_enabled(s, rows)) {
             const PFRowPlan plan = smallm_row_plan(rows);
-            s.iu4_smallm_gate_invoker->Run(
-                s.iu4_smallm_routes[plan.bucket].gate_args[layer].get(),
-                ::StreamConfig{stream, false});
+            if (s.smallm_ck_variant == 1) {
+                s.iu4_smallm_gate_v3_invoker->Run(
+                    s.iu4_smallm_routes[plan.bucket].gate_args[layer].get(),
+                    ::StreamConfig{stream, false});
+            } else {
+                s.iu4_smallm_gate_invoker->Run(
+                    s.iu4_smallm_routes[plan.bucket].gate_args[layer].get(),
+                    ::StreamConfig{stream, false});
+            }
         } else if (iu4_decode_width_enabled(s, rows)) {
             s.iu4_decode_invoker->Run(
                 s.iu4_gate_decode_args[layer][rows].get(), ::StreamConfig{stream, false});
@@ -2281,9 +2335,15 @@ void run_down_fused(PFState & s, int layer, int rows, float * output, hipStream_
             promptforge_iu4::launch_gemm<PF_I>(
                 activations, matrix, s.down_out, rows, PF_H, stream);
         } else if (s.pending_down_smallm_bucket >= 0) {
-            s.iu4_smallm_down_invoker->Run(
-                s.iu4_smallm_routes[s.pending_down_smallm_bucket].down_args[layer].get(),
-                ::StreamConfig{stream, false});
+            if (s.smallm_ck_variant == 1) {
+                s.iu4_smallm_down_v3_invoker->Run(
+                    s.iu4_smallm_routes[s.pending_down_smallm_bucket].down_args[layer].get(),
+                    ::StreamConfig{stream, false});
+            } else {
+                s.iu4_smallm_down_invoker->Run(
+                    s.iu4_smallm_routes[s.pending_down_smallm_bucket].down_args[layer].get(),
+                    ::StreamConfig{stream, false});
+            }
         } else if (iu4_decode_width_enabled(s, rows)) {
             s.iu4_decode_invoker->Run(
                 s.iu4_down_decode_args[layer][rows].get(), ::StreamConfig{stream, false});
@@ -2346,9 +2406,15 @@ void run_gdn_qkvz(PFState & s, int layer, int rows, const float * input, hipStre
     }
     if (smallm_gdn_iu4_route_enabled(s, rows)) {
         const PFRowPlan plan = smallm_row_plan(rows);
-        s.iu4_smallm_gate_invoker->Run(
-            s.iu4_smallm_routes[plan.bucket].gdn_args[layer].get(),
-            ::StreamConfig{stream, false});
+        if (s.smallm_ck_variant == 1) {
+            s.iu4_smallm_gate_v3_invoker->Run(
+                s.iu4_smallm_routes[plan.bucket].gdn_args[layer].get(),
+                ::StreamConfig{stream, false});
+        } else {
+            s.iu4_smallm_gate_invoker->Run(
+                s.iu4_smallm_routes[plan.bucket].gdn_args[layer].get(),
+                ::StreamConfig{stream, false});
+        }
     } else if (rows == PF_TAIL_M) {
         s.gdn_tail1476_invoker->Run(s.gdn_tail1476_args[layer].get(), ::StreamConfig{stream, false});
     } else if (rows == PF_CHECKPOINT_M) {
@@ -2415,9 +2481,15 @@ void run_gdn_output(PFState & s, int layer, int rows, const float * input,
         input, nullptr, activations, rows, stream);
     if (smallm_gdn_output_iu4_route_enabled(s, rows)) {
         const PFRowPlan plan = smallm_row_plan(rows);
-        s.iu4_smallm_down_invoker->Run(
-            s.iu4_smallm_routes[plan.bucket].gdn_output_args[layer].get(),
-            ::StreamConfig{stream, false});
+        if (s.smallm_ck_variant == 1) {
+            s.iu4_smallm_down_v3_invoker->Run(
+                s.iu4_smallm_routes[plan.bucket].gdn_output_args[layer].get(),
+                ::StreamConfig{stream, false});
+        } else {
+            s.iu4_smallm_down_invoker->Run(
+                s.iu4_smallm_routes[plan.bucket].gdn_output_args[layer].get(),
+                ::StreamConfig{stream, false});
+        }
     } else if (iu4_decode_width_enabled(s, rows)) {
         s.gdn_output_decode_invoker->Run(
             s.gdn_output_decode_args[layer][rows].get(), ::StreamConfig{stream, false});
@@ -2522,6 +2594,16 @@ bool promptforge_backend_init(int device) {
         return false;
     }
     s.ngram_m65_iu4_enabled = ngram_m65_iu4 && std::strcmp(ngram_m65_iu4, "1") == 0;
+    const char * smallm_ck_variant_env = std::getenv("PROMPTFORGE_SMALLM_CK_VARIANT");
+    if (smallm_ck_variant_env && smallm_ck_variant_env[0] &&
+        std::strcmp(smallm_ck_variant_env, "0") != 0 &&
+        std::strcmp(smallm_ck_variant_env, "1") != 0) {
+        std::fprintf(stderr,
+            "promptforge: PROMPTFORGE_SMALLM_CK_VARIANT must be 0 or 1\n");
+        return false;
+    }
+    s.smallm_ck_variant =
+        smallm_ck_variant_env && std::strcmp(smallm_ck_variant_env, "1") == 0;
     const char * graph_opt = std::getenv("GGML_CUDA_GRAPH_OPT");
     if ((s.ffn_correction_enabled || s.ffn_hadamard || s.gdn_enabled ||
          s.attention_enabled || s.gdn_output_enabled) &&

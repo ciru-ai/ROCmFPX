@@ -8629,6 +8629,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         exponent <<= 1;
     }
 #endif
+    for (int64_t ne0 : {617, 640, 768}) {
+        for (bool mask : {false, true}) {
+            test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {ne0, 1024, 1, 1}, mask));
+        }
+    }
     for (bool mask : {false, true}) {
         for (bool sinks : {false, true}) {
             for (float max_bias : {0.0f, 8.0f}) {
@@ -9068,6 +9073,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Exercise both sides of the Kairic prefill gate, partial batches, and
+    // recurrent snapshot output. Non-128/KDA shapes must retain the full grid.
+    for (int64_t nt : {95, 96, 97, 512}) {
+        for (int64_t snapshots : {1, 4}) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, nt, 2, 2, true, false, snapshots));
+        }
+    }
+    for (int64_t hs : {16, 32, 64, 128}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, hs, 96, 1));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, hs, 96, 1, 1, false, true));
+    }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
